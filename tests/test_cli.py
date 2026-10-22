@@ -155,3 +155,17 @@ def test_invalid_stack_name_is_a_usage_error():
     result = CliRunner().invoke(cli.main, ["token", "-e", "Not A Stack"])
     assert result.exit_code == 2
     assert "not a valid name" in result.output
+
+
+def test_token_refresh_flag_forces_a_refresh(token_endpoint):
+    calls, responses = token_endpoint
+    responses["/oauth2/v1/token"] = httpx.Response(200, json={
+        "access_token": "forced-access", "refresh_token": "forced-refresh", "expires_in": "3599",
+        "refresh_token_expires_in": "2591999"})
+    store = TokenStore()
+    store.put("dev", "awa-cli", stored())          # still valid for an hour
+    store.set_active_client("dev", "awa-cli")
+    result = CliRunner().invoke(cli.main, ["token", "--refresh"])
+    assert result.exit_code == 0, result.output
+    assert "forced-access" in result.output
+    assert b"grant_type=refresh_token" in calls[0].content

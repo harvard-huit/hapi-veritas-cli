@@ -70,12 +70,12 @@ def resolve_client(store, stack, app):
     return client
 
 
-def fresh_record(store, stack, client):
-    """The stored token for (stack, client), refreshed first if it has expired."""
+def fresh_record(store, stack, client, force_refresh=False):
+    """The stored token for (stack, client), refreshed first if it has expired (or if forced)."""
     record = store.get(stack, client)
     if not record:
         fail(f"no token for {client} on {stack}: run `veritas login -e {stack} --app {client}`")
-    if not is_expired(record.get("expires_at")):
+    if not force_refresh and not is_expired(record.get("expires_at")):
         return record
     if record.get("grant") == "client_credentials":
         fail(f"the m2m token for {client} on {stack} expired and client_credentials has no "
@@ -223,10 +223,15 @@ def m2m(stack, client_id, secret_env, scope, resource):
 @main.command()
 @with_stack
 @with_app
-def token(stack, app):
+@click.option("--refresh", "force_refresh", is_flag=True,
+              help="Refresh now, even if the access token is still valid (e.g. to test what a "
+                   "refresh does after a permission change).")
+def token(stack, app, force_refresh):
     """Print a valid access token (refreshing it if needed). For $(veritas token)."""
     store = token_store()
-    record = fresh_record(store, stack, resolve_client(store, stack, app))
+    record = fresh_record(store, stack, resolve_client(store, stack, app), force_refresh=force_refresh)
+    if force_refresh:
+        click.echo(f"refreshed: access token expires {describe_time(record['expires_at'])}", err=True)
     click.echo(record["access_token"])
 
 
