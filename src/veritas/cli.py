@@ -20,7 +20,8 @@ from .store import StoreError, TokenStore
 # Refresh this long before the AS says the token expires, so a token is never handed out with
 # only a second or two of life left.
 EXPIRY_SKEW_SECONDS = 60
-DEFAULT_QUOTA_PROXY = "ais-openai-direct-v2"
+# The proxy BASE PATH, not its name: ais-openai-direct-v2 is served at /ais-openai-direct/v2.
+DEFAULT_QUOTA_BASE_PATH = "/ais-openai-direct/v2"
 # Response headers worth showing next to a `call`: the AIS quota and Apigee rate-limit ones.
 QUOTA_HEADER_MARKERS = ("quota", "ratelimit", "x-ais", "remaining")
 
@@ -345,15 +346,16 @@ def call(stack, app, target, method, data, headers, any_host):
 @main.command()
 @with_stack
 @with_app
-@click.option("--proxy", default=DEFAULT_QUOTA_PROXY, show_default=True,
-              help="AIS proxy whose quota to read (each has its own quota name): "
-                   "ais-openai-direct-v2, ais-google-gemini, ais-bedrock-llm, "
-                   "ais-openai-direct-hdsi, ais-openai-direct-comdev.")
-def quota(stack, app, proxy):
-    """Show the app's quota and what is left, from GET /<proxy>/apigee/quota."""
+@click.argument("base_path", default=DEFAULT_QUOTA_BASE_PATH, required=False)
+def quota(stack, app, base_path):
+    """Show the app's quota, and the user's when the token carries one, from
+    GET <BASE_PATH>/apigee/quota. BASE_PATH is the proxy's base path, not its name. Each
+    quota name has its own counters. Today's AIS base paths: /ais-openai-direct/v2 (default),
+    /ais-openai-direct-hdsi/v2, /ais-openai-direct-comdev/v2, /ais-google-gemini,
+    /ais-bedrock-llm."""
     store = token_store()
     record = fresh_record(store, stack, resolve_client(store, stack, app))
-    url = f"{stack.gateway_base}/{proxy}/apigee/quota"
+    url = f"{stack.gateway_base}/{base_path.strip('/')}/apigee/quota"
     response = _send(record["access_token"], "GET", url, (), None)
     try:
         payload = response.json()

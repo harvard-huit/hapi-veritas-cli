@@ -23,8 +23,8 @@ there is no secret:
 veritas login --app awa-hello_world        # opens the browser for HarvardKey, catches the redirect on :8080
 veritas whoami                             # local token record, then /userinfo
 veritas token                              # prints a valid access token, refreshing it if it expired
-veritas call /ais-openai-direct-v2/v1/models
-veritas quota --proxy ais-bedrock-llm      # GET /<proxy>/apigee/quota
+veritas call /ais-openai-direct/v2/models
+veritas quota /ais-bedrock-llm            # GET <base path>/apigee/quota (default /ais-openai-direct/v2)
 veritas logout
 ```
 
