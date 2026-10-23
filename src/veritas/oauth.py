@@ -199,6 +199,10 @@ def receive_callback(redirect_uri, expected_state, timeout=300, on_ready=None):
     finished = []
 
     class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        # A connection that never sends a request (a browser's speculative preconnect) would
+        # otherwise block handle_request() forever, so the redirect behind it is never read.
+        timeout = 5
+
         def do_GET(self):
             request_parts = urlsplit(self.path)
             if request_parts.path != expected_path:
@@ -235,6 +239,9 @@ def receive_callback(redirect_uri, expected_state, timeout=300, on_ready=None):
                             f"else is using the port; free it, because the app's registered "
                             f"callback fixes the port") from problem
 
+    # An idle connection timing out is expected (see CallbackHandler.timeout): drop it quietly
+    # rather than printing a traceback over the sign-in prompt.
+    server.handle_error = lambda request, client_address: None
     with server:
         server.timeout = 1
         if on_ready:

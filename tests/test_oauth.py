@@ -174,6 +174,37 @@ def test_loopback_returns_code_and_ignores_other_paths():
     assert result.error is None
 
 
+def test_loopback_survives_a_connection_that_never_sends(monkeypatch):
+    # A browser preconnect: a socket that connects and says nothing. The real redirect after it
+    # must still be read.
+    port = free_port()
+    idle = []
+
+    def connect_silently_then_redirect():
+        idle.append(socket.create_connection(("127.0.0.1", port)))
+        return "/callback?code=after-idle&state=good-state"
+
+    outcome = {}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def on_ready():
+        def send():
+            path = connect_silently_then_redirect()
+            opener.open(f"http://127.0.0.1:{port}{path}", timeout=15).read()
+        threading.Thread(target=send).start()
+
+    def receive():
+        outcome["result"] = receive_callback(f"http://localhost:{port}/callback", "good-state",
+                                             timeout=20, on_ready=on_ready)
+
+    receiver = threading.Thread(target=receive)
+    receiver.start()
+    receiver.join(25)
+    for connection in idle:
+        connection.close()
+    assert outcome["result"].code == "after-idle"
+
+
 def test_loopback_rejects_wrong_state():
     port = free_port()
     result = run_receiver(f"http://localhost:{port}/callback", "good-state",
