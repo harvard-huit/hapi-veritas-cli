@@ -2,6 +2,7 @@ import base64
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlsplit
 
@@ -135,24 +136,33 @@ def free_port():
 
 def run_receiver(redirect_uri, state, requests_to_send):
     outcome = {}
+    # No proxies: on macOS urllib reads the system proxy settings, and a proxied request to
+    # 127.0.0.1 never reaches the listener (seen on GitHub's macOS runners).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def send_requests():
         for path in requests_to_send:
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).read()
-            except Exception:
-                pass
+                opener.open(f"http://127.0.0.1:{port}{path}", timeout=5).read()
+            except urllib.error.HTTPError:
+                pass   # the 404 for /favicon.ico is expected
+            except Exception as problem:
+                outcome.setdefault("send_errors", []).append(f"{path}: {problem!r}")
 
     port = parse_redirect_uri(redirect_uri)[0]
 
     def receive():
-        outcome["result"] = receive_callback(redirect_uri, state, timeout=10,
-                                             on_ready=lambda: threading.Thread(
-                                                 target=send_requests).start())
+        try:
+            outcome["result"] = receive_callback(redirect_uri, state, timeout=10,
+                                                 on_ready=lambda: threading.Thread(
+                                                     target=send_requests).start())
+        except Exception as problem:
+            outcome["error"] = repr(problem)
 
     receiver = threading.Thread(target=receive)
     receiver.start()
     receiver.join(15)
+    assert "result" in outcome, f"receiver failed: {outcome}"
     return outcome["result"]
 
 
