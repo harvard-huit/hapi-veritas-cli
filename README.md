@@ -47,6 +47,27 @@ Other useful commands:
 `login` and `m2m` both make the client they used the **active client** for that stack, so the
 other commands don't need `--app`.
 
+### Claude Code as you
+
+```bash
+veritas login -e dev --app awa-veritas_cli     # once; the app needs Bedrock granted in AI access
+veritas claude -e dev                          # interactive Claude Code
+veritas claude -e dev -p "explain this repo"   # anything after the veritas options goes to claude
+veritas claude -e dev --model us.anthropic.claude-sonnet-5-5
+```
+
+`veritas claude` runs Claude Code in Bedrock mode against `<gateway>/ais-bedrock-llm/v2`, with no
+AWS credentials. Your user token goes as `Authorization: Bearer`, through Claude Code's
+`apiKeyHelper`, which re-runs `veritas token` every 5 minutes. So a session outlasts the one-hour
+token. It removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS` and
+`AWS_BEARER_TOKEN_BEDROCK` from Claude Code's environment, so a key in your profile can't be used
+instead.
+
+Every request is charged to your **per-user** Bedrock limit, inside the app's. Claude Code sends a
+lot of context with each request: a one-line Haiku prompt cost about $0.05. A per-user limit sized
+for curl tests (cents per hour) will stop a session on its first request with a 429. Set
+`CLAUDE_CODE_MAX_RETRIES=1` to make that fail fast instead of retrying.
+
 ## Stacks
 
 `-e` selects the stack. If you don't pass it, the CLI uses `VERITAS_ENV`, then `default_stack`

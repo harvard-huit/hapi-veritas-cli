@@ -2,6 +2,8 @@
 
 import json
 import os
+import shlex
+import shutil
 import sys
 import time
 import webbrowser
@@ -24,6 +26,13 @@ EXPIRY_SKEW_SECONDS = 60
 DEFAULT_QUOTA_BASE_PATH = "/ais-openai-direct/v2"
 # Response headers worth showing next to a `call`: the AIS quota and Apigee rate-limit ones.
 QUOTA_HEADER_MARKERS = ("quota", "ratelimit", "x-ais", "remaining")
+# `veritas claude`: Claude Code in Bedrock mode, pointed at the gateway's pass-through Bedrock proxy.
+BEDROCK_PROXY_PATH = "/ais-bedrock-llm/v2"
+DEFAULT_BEDROCK_REGION = "us-east-1"
+# Credentials Claude Code would prefer over the gateway token, or send in its place. Removed from
+# the child's environment so a key exported in a profile can't silently win.
+COMPETING_CLAUDE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+                                "AWS_BEARER_TOKEN_BEDROCK")
 
 
 def auth_server(stack):
@@ -394,6 +403,53 @@ def discover(stack):
         fail(f"discovery failed (HTTP {problem.status})", problem.body)
     except httpx.HTTPError as problem:
         fail(f"discovery failed: {problem}")
+
+
+def claude_environment(stack, base_environment):
+    """The environment Claude Code runs with: Bedrock mode against the stack's gateway, no AWS
+    signing (the gateway authenticates), and no competing credential."""
+    environment = {name: value for name, value in base_environment.items()
+                   if name not in COMPETING_CLAUDE_CREDENTIALS}
+    environment.update({
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "ANTHROPIC_BEDROCK_BASE_URL": f"{stack.gateway_base}{BEDROCK_PROXY_PATH}",
+    })
+    environment.setdefault("AWS_REGION", DEFAULT_BEDROCK_REGION)
+    return environment
+
+
+def claude_settings(stack, client):
+    """--settings for Claude Code. apiKeyHelper is how Claude Code refreshes a gateway token mid-
+    session: it re-runs the helper (every 5 minutes, and on a 401) and sends the output as
+    `Authorization: Bearer`. The helper is this same CLI by interpreter path, so it works without
+    `veritas` on PATH and in whatever virtualenv this one runs from."""
+    helper = shlex.join([sys.executable, "-m", "veritas.cli", "token",
+                         "-e", stack.name, "--app", client])
+    return json.dumps({"apiKeyHelper": helper})
+
+
+@main.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@with_stack
+@with_app
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def claude(stack, app, claude_args):
+    """Run Claude Code through the stack's Bedrock proxy as you, on your user token.
+
+    Every call is charged to your per-user AI Services limit inside the app's. Arguments after the
+    veritas options go to claude unchanged, e.g. `veritas claude -e dev -p "hello"` or
+    `veritas claude -e dev --model us.anthropic.claude-sonnet-5-5`."""
+    store = token_store()
+    client = resolve_client(store, stack, app)
+    record = fresh_record(store, stack, client)   # fail here, before launching, if not signed in
+    if record.get("grant") == "client_credentials":
+        fail(f"{client} holds an m2m token, which names no user: sign in with "
+             f"`veritas login -e {stack} --app <APP NAME>`")
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        fail("claude (Claude Code) is not on PATH: install it first")
+    arguments = [claude_path, "--settings", claude_settings(stack, client), *claude_args]
+    os.execve(claude_path, arguments, claude_environment(stack, os.environ))
 
 
 def run():

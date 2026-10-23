@@ -1,3 +1,4 @@
+import json
 import time
 
 import httpx
@@ -169,3 +170,48 @@ def test_token_refresh_flag_forces_a_refresh(token_endpoint):
     assert result.exit_code == 0, result.output
     assert "forced-access" in result.output
     assert b"grant_type=refresh_token" in calls[0].content
+
+
+def test_claude_runs_claude_code_on_the_gateway_with_a_refreshing_token(monkeypatch, token_endpoint):
+    store = TokenStore()
+    store.put("dev", "awa-cli", stored())
+    store.set_active_client("dev", "awa-cli")
+    launched = {}
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(cli.os, "execve", lambda path, arguments, environment: launched.update(
+        path=path, arguments=arguments, environment=environment))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a-key-from-my-profile")
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "another-key")
+
+    result = CliRunner().invoke(cli.main, ["claude", "-e", "dev", "-p", "hello", "--model", "m"])
+    assert result.exit_code == 0, result.output
+
+    assert launched["path"] == "/usr/local/bin/claude"
+    settings_flag, settings, *passed_through = launched["arguments"][1:]
+    assert settings_flag == "--settings"
+    assert passed_through == ["-p", "hello", "--model", "m"]
+    helper = json.loads(settings)["apiKeyHelper"]
+    assert helper.endswith("-m veritas.cli token -e dev --app awa-cli")
+
+    environment = launched["environment"]
+    assert environment["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert environment["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    assert environment["ANTHROPIC_BEDROCK_BASE_URL"] == "https://dev.apis.huit.harvard.edu/ais-bedrock-llm/v2"
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "AWS_BEARER_TOKEN_BEDROCK" not in environment
+
+
+def test_claude_refuses_an_m2m_token(monkeypatch, token_endpoint):
+    store = TokenStore()
+    store.put("dev", "consumer-key", stored(grant="client_credentials", refresh_in=None))
+    monkeypatch.setattr(cli.os, "execve", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["claude", "--app", "consumer-key"])
+    assert result.exit_code == 1
+    assert "names no user" in result.output
+
+
+def test_claude_without_a_login_says_how_to_sign_in(monkeypatch):
+    monkeypatch.setattr(cli.os, "execve", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["claude", "-e", "stage"])
+    assert result.exit_code == 1
+    assert "veritas login" in result.output
