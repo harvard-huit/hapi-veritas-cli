@@ -6,6 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from veritas import cli
+from veritas import client as core
 from veritas.oauth import AuthServer
 from veritas.stacks import resolve
 from veritas.store import TokenStore
@@ -26,7 +27,7 @@ def token_endpoint(monkeypatch):
             calls.append(request)
         return responses.get(request.url.path, httpx.Response(404))
 
-    monkeypatch.setattr(cli, "auth_server", lambda stack: AuthServer(
+    monkeypatch.setattr(core, "auth_server", lambda stack: AuthServer(
         stack, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
     return calls, responses
 

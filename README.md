@@ -47,6 +47,39 @@ Other useful commands:
 `login` and `m2m` both make the client they used the **active client** for that stack, so the
 other commands don't need `--app`.
 
+### An Authorization header for your own code
+
+For skills, functions and workshop notebooks that call HUIT APIs **as the person running them**.
+Nobody needs an API subscription or their own Apigee app. You register one user-token app (for a
+workshop, the workshop's), add people to its Grouper group, and each person runs
+`veritas login --app <that app>` once.
+
+```bash
+curl -H "$(veritas header -e dev)" https://dev.apis.huit.harvard.edu/ais-openai-direct/v2/apigee/quota
+```
+
+```python
+import veritas, httpx, requests
+
+veritas.headers(app="awa-workshop_x")            # {"Authorization": "Bearer ..."}
+veritas.token(app="awa-workshop_x")              # just the token
+veritas.gateway()                                # https://prod.apis.huit.harvard.edu
+
+# Fetches the token on each request (refreshing as needed) and retries once on a 401:
+httpx.get(url, auth=veritas.Auth(app="awa-workshop_x"))
+requests.get(url, auth=veritas.Auth(app="awa-workshop_x"))
+
+veritas.login(app="awa-workshop_x")              # the browser sign-in, from Python
+```
+
+- **`stack=`** works like `-e`: the default is `VERITAS_ENV`, then `default_stack`, then prod.
+  **`app=`** works like `--app`: the default is `VERITAS_APP`, then the stack's active client.
+- **The CLI and Python share one token store**, so a terminal login is picked up by Python and the
+  other way round.
+- **Only `login()` opens a browser.** Everything else raises `veritas.VeritasError` with the
+  command to run, so a script fails fast instead of hanging on a sign-in page.
+- **`import veritas` does not load the CLI**, the layer that prints and exits.
+
 ### Claude Code as you
 
 ```bash
