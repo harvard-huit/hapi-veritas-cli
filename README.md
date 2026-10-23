@@ -96,6 +96,12 @@ token. It removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM
 `AWS_BEARER_TOKEN_BEDROCK` from Claude Code's environment, so a key in your profile can't be used
 instead.
 
+**Pick the model yourself:** `--model <inference profile id>` at launch, or `/model` inside Claude
+Code. veritas sets no model on purpose, so no model ID is hardcoded that AWS could retire.
+Left alone, Claude Code uses its own Bedrock default, which is currently Opus, the priciest. The
+profiles available on a stack are listed by
+`veritas call -e dev "/ais-bedrock-llm/v2/inference-profiles?maxResults=100"`.
+
 Every request is charged to your **per-user** Bedrock limit, inside the app's. Claude Code sends a
 lot of context with each request: a one-line Haiku prompt cost about $0.05. A per-user limit sized
 for curl tests (cents per hour) will stop a session on its first request with a 429. Set
