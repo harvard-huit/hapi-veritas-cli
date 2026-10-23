@@ -31,7 +31,9 @@ def _record_key(stack, client):
     return f"{str(stack)}:{client}"
 
 
-def _write_private_json(path, content):
+def write_private_json(path, content):
+    """Write JSON readable only by this user (0600 in a 0700 directory). Windows ignores the modes;
+    the file lives under the user's profile, which only that user can read by default."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -62,12 +64,12 @@ class FileBackend:
     def put(self, key, serialized):
         records = _read_json(self.path)
         records[key] = json.loads(serialized)
-        _write_private_json(self.path, records)
+        write_private_json(self.path, records)
 
     def delete(self, key):
         records = _read_json(self.path)
         if records.pop(key, None) is not None:
-            _write_private_json(self.path, records)
+            write_private_json(self.path, records)
 
 
 class KeyringBackend:
@@ -151,4 +153,4 @@ class TokenStore:
             active_by_stack.pop(str(stack), None)
         else:
             active_by_stack[str(stack)] = client
-        _write_private_json(self.config_path, config)
+        write_private_json(self.config_path, config)

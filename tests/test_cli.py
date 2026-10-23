@@ -1,3 +1,4 @@
+import pathlib
 import json
 import time
 
@@ -179,20 +180,21 @@ def test_claude_runs_claude_code_on_the_gateway_with_a_refreshing_token(monkeypa
     store.set_active_client("dev", "awa-cli")
     launched = {}
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
-    monkeypatch.setattr(cli.os, "execve", lambda path, arguments, environment: launched.update(
-        path=path, arguments=arguments, environment=environment))
+    monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.update(
+        arguments=arguments, environment=environment))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "a-key-from-my-profile")
     monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "another-key")
 
     result = CliRunner().invoke(cli.main, ["claude", "-e", "dev", "-p", "hello", "--model", "m"])
     assert result.exit_code == 0, result.output
 
-    assert launched["path"] == "/usr/local/bin/claude"
-    settings_flag, settings, *passed_through = launched["arguments"][1:]
+    claude_path, settings_flag, settings_path, *passed_through = launched["arguments"]
+    assert claude_path == "/usr/local/bin/claude"
     assert settings_flag == "--settings"
     assert passed_through == ["-p", "hello", "--model", "m"]
-    helper = json.loads(settings)["apiKeyHelper"]
-    assert helper.endswith("-m veritas.cli token -e dev --app awa-cli")
+    # Settings travel as a FILE (cmd.exe mangles an inline JSON argument on Windows).
+    helper = json.loads(pathlib.Path(settings_path).read_text())["apiKeyHelper"]
+    assert "-m veritas.cli token -e dev --app awa-cli" in helper.replace('"', "").replace("'", "")
 
     environment = launched["environment"]
     assert environment["CLAUDE_CODE_USE_BEDROCK"] == "1"
@@ -205,17 +207,60 @@ def test_claude_runs_claude_code_on_the_gateway_with_a_refreshing_token(monkeypa
 def test_claude_refuses_an_m2m_token(monkeypatch, token_endpoint):
     store = TokenStore()
     store.put("dev", "consumer-key", stored(grant="client_credentials", refresh_in=None))
-    monkeypatch.setattr(cli.os, "execve", lambda *arguments: pytest.fail("must not launch"))
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
     result = CliRunner().invoke(cli.main, ["claude", "-e", "dev", "--app", "consumer-key"])
     assert result.exit_code == 1
     assert "names no user" in result.output
 
 
 def test_claude_without_a_login_says_how_to_sign_in(monkeypatch):
-    monkeypatch.setattr(cli.os, "execve", lambda *arguments: pytest.fail("must not launch"))
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
     result = CliRunner().invoke(cli.main, ["claude", "-e", "stage"])
     assert result.exit_code == 1
     assert "veritas login" in result.output
+
+
+def test_helper_command_on_windows_reads_the_same_in_cmd_and_git_bash(monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", r"C:\Users\Mark Stacy\proj\.venv\Scripts\python.exe")
+    command = cli.helper_command(resolve("dev"), "awa-veritas_cli", windows=True)
+    assert command == ('"C:/Users/Mark Stacy/proj/.venv/Scripts/python.exe" "-m" "veritas.cli" '
+                       '"token" "-e" "dev" "--app" "awa-veritas_cli"')
+    assert "\\" not in command and "'" not in command
+
+
+def test_helper_command_elsewhere_is_posix_quoted(monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", "/home/me/my venv/bin/python")
+    command = cli.helper_command(resolve("dev"), "awa-veritas_cli", windows=False)
+    assert command == "'/home/me/my venv/bin/python' -m veritas.cli token -e dev --app awa-veritas_cli"
+
+
+def test_settings_file_is_per_stack_and_client(isolated_home):
+    first = cli.claude_settings_file(resolve("dev"), "awa-one app")
+    second = cli.claude_settings_file(resolve("dev"), "awa-two")
+    assert first != second and first.name == "dev-awa-one_app.json"
+    assert "awa-one app" in json.loads(first.read_text())["apiKeyHelper"]
+
+
+def test_windows_launch_runs_a_child_and_exits_with_its_code(monkeypatch):
+    started = {}
+
+    class Child:
+        def __init__(self, arguments, env):
+            started.update(arguments=arguments, env=env)
+            self.waits = 0
+
+        def wait(self):
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt   # Ctrl+C is Claude Code's; veritas keeps waiting
+            return 3
+
+    monkeypatch.setattr(cli.subprocess, "Popen", Child)
+    monkeypatch.setattr(cli.os, "execve", lambda *arguments: pytest.fail("no exec on Windows"))
+    with pytest.raises(SystemExit) as exited:
+        cli.launch(["claude.cmd", "--settings", "x.json"], {"A": "1"}, windows=True)
+    assert exited.value.code == 3
+    assert started == {"arguments": ["claude.cmd", "--settings", "x.json"], "env": {"A": "1"}}
 
 
 def test_default_stack_is_prod_and_veritas_env_overrides_it(monkeypatch):

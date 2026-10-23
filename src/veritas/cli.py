@@ -2,8 +2,10 @@
 
 import json
 import os
+import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -17,7 +19,7 @@ from . import client as core
 from .client import VeritasError
 from .oauth import DEFAULT_REDIRECT_URI, OAuthError
 from .stacks import DEFAULT_STACK, KNOWN_STACKS, StackError, resolve
-from .store import StoreError
+from .store import StoreError, veritas_home, write_private_json
 # The proxy BASE PATH, not its name: ais-openai-direct-v2 is served at /ais-openai-direct/v2.
 DEFAULT_QUOTA_BASE_PATH = "/ais-openai-direct/v2"
 # Response headers worth showing next to a `call`: the AIS quota and Apigee rate-limit ones.
@@ -29,6 +31,9 @@ DEFAULT_BEDROCK_REGION = "us-east-1"
 # the child's environment so a key exported in a profile can't silently win.
 COMPETING_CLAUDE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
                                 "AWS_BEARER_TOKEN_BEDROCK")
+# Windows has no exec: os.execve there starts a SEPARATE process and returns, leaving veritas and
+# Claude Code fighting over one console, and it cannot run npm's claude.cmd at all.
+WINDOWS = os.name == "nt"
 
 
 # --- helpers ----------------------------------------------------------------------------------
@@ -354,14 +359,42 @@ def claude_environment(stack, base_environment):
     return environment
 
 
-def claude_settings(stack, client):
-    """--settings for Claude Code. apiKeyHelper is how Claude Code refreshes a gateway token mid-
-    session: it re-runs the helper (every 5 minutes, and on a 401) and sends the output as
-    `Authorization: Bearer`. The helper is this same CLI by interpreter path, so it works without
-    `veritas` on PATH and in whatever virtualenv this one runs from."""
-    helper = shlex.join([sys.executable, "-m", "veritas.cli", "token",
-                         "-e", stack.name, "--app", client])
-    return json.dumps({"apiKeyHelper": helper})
+def helper_command(stack, client, windows=WINDOWS):
+    """The apiKeyHelper command line: this same CLI by interpreter path, so it works without
+    `veritas` on PATH and in whatever virtualenv this one runs from. On Windows, Claude Code may run
+    the helper through cmd.exe or Git Bash; double-quoted arguments and a forward-slash path read
+    the same in both (bash would eat unquoted backslashes, cmd ignores single quotes)."""
+    arguments = [sys.executable, "-m", "veritas.cli", "token", "-e", stack.name, "--app", client]
+    if not windows:
+        return shlex.join(arguments)
+    arguments[0] = arguments[0].replace("\\", "/")
+    return " ".join(f'"{argument}"' for argument in arguments)
+
+
+def claude_settings_file(stack, client, windows=WINDOWS):
+    """Write Claude Code's settings for this stack and client, and return the file's path.
+
+    apiKeyHelper is how Claude Code refreshes a gateway token mid-session: it re-runs the helper
+    (every 5 minutes, and on a 401) and sends the output as `Authorization: Bearer`. The settings go
+    in a FILE rather than an inline JSON argument because cmd.exe, which runs npm's claude.cmd on
+    Windows, mangles the quotes in an inline JSON string. One file per stack and client, so two
+    sessions on different apps never rewrite each other's helper."""
+    safe_client = re.sub(r"[^A-Za-z0-9._-]", "_", client)
+    path = veritas_home() / "claude" / f"{stack.name}-{safe_client}.json"
+    write_private_json(path, {"apiKeyHelper": helper_command(stack, client, windows)})
+    return path
+
+
+def launch(arguments, environment, windows=WINDOWS):
+    """Replace this process with Claude Code; on Windows, run it as a child and exit with its code."""
+    if not windows:
+        os.execve(arguments[0], arguments, environment)
+    process = subprocess.Popen(arguments, env=environment)
+    while True:
+        try:
+            sys.exit(process.wait())
+        except KeyboardInterrupt:
+            continue   # Ctrl+C belongs to Claude Code, which shares the console; keep waiting
 
 
 @main.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -383,8 +416,8 @@ def claude(stack, app, claude_args):
     claude_path = shutil.which("claude")
     if not claude_path:
         fail("claude (Claude Code) is not on PATH: install it first")
-    arguments = [claude_path, "--settings", claude_settings(stack, client), *claude_args]
-    os.execve(claude_path, arguments, claude_environment(stack, os.environ))
+    arguments = [claude_path, "--settings", str(claude_settings_file(stack, client)), *claude_args]
+    launch(arguments, claude_environment(stack, os.environ))
 
 
 def run():

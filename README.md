@@ -107,6 +107,33 @@ lot of context with each request: a one-line Haiku prompt cost about $0.05. A pe
 for curl tests (cents per hour) will stop a session on its first request with a 429. Set
 `CLAUDE_CODE_MAX_RETRIES=1` to make that fail fast instead of retrying.
 
+## Windows
+
+Everything works on Windows. The examples above are bash; in PowerShell:
+
+```powershell
+cd veritas-cli
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -e .
+.venv\Scripts\Activate.ps1
+
+$env:VERITAS_ENV = "dev"                       # instead of: export VERITAS_ENV=dev
+veritas login --app awa-veritas_cli
+curl.exe -H (veritas header) https://dev.apis.huit.harvard.edu/ais-bedrock-llm/apigee/quota
+veritas claude --model us.anthropic.claude-haiku-4-5-20251001-v1:0
+```
+
+- **Use `curl.exe`, not `curl`.** In Windows PowerShell 5, `curl` is an alias for
+  `Invoke-WebRequest`, which takes different arguments.
+- **Tokens go in Windows Credential Manager**, the counterpart of the macOS Keychain. With
+  `VERITAS_TOKEN_STORE=file` they go in `%USERPROFILE%\.config\veritas\tokens.json`; Windows
+  doesn't enforce the 0600 mode there, but the profile folder is private to you by default.
+- **`veritas claude` runs Claude Code as a child process** on Windows, because Windows has no
+  `exec`, and exits with its exit code. Ctrl+C goes to Claude Code. Its settings are written to
+  `%USERPROFILE%\.config\veritas\claude\<stack>-<app>.json`, and the token helper's command is
+  quoted to read the same in cmd.exe and Git Bash.
+- **The tests run on Windows, macOS and Linux in GitHub Actions** (`veritas-cli tests`).
+
 ## Stacks
 
 `-e` selects the stack. If you don't pass it, the CLI uses `VERITAS_ENV`, then `default_stack`
