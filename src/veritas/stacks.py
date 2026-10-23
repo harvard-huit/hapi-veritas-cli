@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 
 KNOWN_STACKS = ("dev", "test", "sand", "stage", "prod")
-DEFAULT_STACK = "dev"
+DEFAULT_STACK = "prod"
 STACK_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 # Stacks whose AS host has no stack segment.

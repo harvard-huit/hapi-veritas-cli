@@ -45,7 +45,7 @@ def test_token_prints_without_refresh_when_valid(token_endpoint):
     store = TokenStore()
     store.put("dev", "awa-cli", stored())
     store.set_active_client("dev", "awa-cli")
-    result = CliRunner().invoke(cli.main, ["token"])
+    result = CliRunner().invoke(cli.main, ["token", "-e", "dev"])
     assert result.exit_code == 0, result.output
     assert result.output.strip() == "old-access"
     assert calls == []
@@ -71,7 +71,7 @@ def test_expired_m2m_token_asks_for_m2m_not_login(token_endpoint):
     store = TokenStore()
     store.put("dev", "consumer-key", stored(grant="client_credentials", expires_in=-10,
                                             refresh_in=None))
-    result = CliRunner().invoke(cli.main, ["token", "--app", "consumer-key"])
+    result = CliRunner().invoke(cli.main, ["token", "-e", "dev", "--app", "consumer-key"])
     assert result.exit_code == 1
     assert "veritas m2m" in result.output
 
@@ -87,7 +87,7 @@ def test_m2m_reads_secret_from_env_and_stores(token_endpoint, monkeypatch):
     responses["/oauth2/v1/token"] = httpx.Response(200, json={
         "access_token": "m2m-access", "expires_in": "3599", "application_name": "svc-app"})
     monkeypatch.setenv("SVC_SECRET", "s3cret")
-    result = CliRunner().invoke(cli.main, ["m2m", "--client-id", "consumer-key",
+    result = CliRunner().invoke(cli.main, ["m2m", "-e", "dev", "--client-id", "consumer-key",
                                            "--secret-env", "SVC_SECRET"])
     assert result.exit_code == 0, result.output
     assert "s3cret" not in result.output and "m2m-access" not in result.output
@@ -107,7 +107,7 @@ def test_whoami_for_m2m_reports_no_user(token_endpoint):
     calls, _ = token_endpoint
     store = TokenStore()
     store.put("dev", "consumer-key", stored(grant="client_credentials", refresh_in=None))
-    result = CliRunner().invoke(cli.main, ["whoami", "--app", "consumer-key"])
+    result = CliRunner().invoke(cli.main, ["whoami", "-e", "dev", "--app", "consumer-key"])
     assert result.exit_code == 0, result.output
     assert "carries no user" in result.output
     assert calls == []
@@ -117,7 +117,7 @@ def test_logout_clears_token_and_active(token_endpoint):
     store = TokenStore()
     store.put("dev", "awa-cli", stored())
     store.set_active_client("dev", "awa-cli")
-    result = CliRunner().invoke(cli.main, ["logout"])
+    result = CliRunner().invoke(cli.main, ["logout", "-e", "dev"])
     assert result.exit_code == 0, result.output
     assert store.get("dev", "awa-cli") is None
     assert store.active_client("dev") is None
@@ -166,7 +166,7 @@ def test_token_refresh_flag_forces_a_refresh(token_endpoint):
     store = TokenStore()
     store.put("dev", "awa-cli", stored())          # still valid for an hour
     store.set_active_client("dev", "awa-cli")
-    result = CliRunner().invoke(cli.main, ["token", "--refresh"])
+    result = CliRunner().invoke(cli.main, ["token", "-e", "dev", "--refresh"])
     assert result.exit_code == 0, result.output
     assert "forced-access" in result.output
     assert b"grant_type=refresh_token" in calls[0].content
@@ -205,7 +205,7 @@ def test_claude_refuses_an_m2m_token(monkeypatch, token_endpoint):
     store = TokenStore()
     store.put("dev", "consumer-key", stored(grant="client_credentials", refresh_in=None))
     monkeypatch.setattr(cli.os, "execve", lambda *arguments: pytest.fail("must not launch"))
-    result = CliRunner().invoke(cli.main, ["claude", "--app", "consumer-key"])
+    result = CliRunner().invoke(cli.main, ["claude", "-e", "dev", "--app", "consumer-key"])
     assert result.exit_code == 1
     assert "names no user" in result.output
 
@@ -215,3 +215,19 @@ def test_claude_without_a_login_says_how_to_sign_in(monkeypatch):
     result = CliRunner().invoke(cli.main, ["claude", "-e", "stage"])
     assert result.exit_code == 1
     assert "veritas login" in result.output
+
+
+def test_default_stack_is_prod_and_veritas_env_overrides_it(monkeypatch):
+    store = TokenStore()
+    store.put("prod", "awa-cli", dict(stored(), access_token="prod-access"))
+    store.set_active_client("prod", "awa-cli")
+    store.put("dev", "awa-cli", dict(stored(), access_token="dev-access"))
+    store.set_active_client("dev", "awa-cli")
+
+    result = CliRunner().invoke(cli.main, ["token"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "prod-access"
+
+    monkeypatch.setenv("VERITAS_ENV", "dev")
+    result = CliRunner().invoke(cli.main, ["token"])
+    assert result.output.strip() == "dev-access"

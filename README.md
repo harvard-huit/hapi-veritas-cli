@@ -71,7 +71,8 @@ for curl tests (cents per hour) will stop a session on its first request with a 
 ## Stacks
 
 `-e` selects the stack. If you don't pass it, the CLI uses `VERITAS_ENV`, then `default_stack`
-from the config file, then `dev`. The stack names are not a fixed list: anything that matches
+from the config file, then `prod`. While developing, pass `-e dev`, or
+`export VERITAS_ENV=dev` (or set `"default_stack": "dev"` in the config file) to change the default. The stack names are not a fixed list: anything that matches
 `[a-z][a-z0-9-]*` is accepted.
 
 For each stack, the CLI resolves two base URLs. The first source that has a value wins:
