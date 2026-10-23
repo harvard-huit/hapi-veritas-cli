@@ -16,6 +16,7 @@ tokens should not be sent there.
 """
 
 import http.server
+import socketserver
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -186,6 +187,15 @@ def parse_redirect_uri(redirect_uri):
     return parts.port, parts.path or "/"
 
 
+class _LoopbackServer(http.server.HTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind resolves its own name with socket.getfqdn(), a reverse DNS lookup
+        # that can stall for many seconds on some networks (it did on GitHub's macOS runners),
+        # delaying the listener the browser is about to redirect to. Loopback needs no name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def receive_callback(redirect_uri, expected_state, timeout=300, on_ready=None):
     """Listen on the loopback redirect, return the first callback that hits the right path.
 
@@ -233,7 +243,7 @@ def receive_callback(redirect_uri, expected_state, timeout=300, on_ready=None):
             pass
 
     try:
-        server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
+        server = _LoopbackServer(("127.0.0.1", port), CallbackHandler)
     except OSError as problem:
         raise LoopbackError(f"cannot listen on 127.0.0.1:{port} ({problem.strerror}). Something "
                             f"else is using the port; free it, because the app's registered "
