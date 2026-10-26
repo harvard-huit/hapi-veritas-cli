@@ -59,15 +59,15 @@ curl -H "$(veritas header -e dev)" https://dev.apis.huit.harvard.edu/ais-openai-
 ```
 
 ```python
-import veritas, httpx, requests
+import requests   # pip install requests
+import veritas
 
 veritas.headers(app="awa-workshop_x")            # {"Authorization": "Bearer ..."}
 veritas.token(app="awa-workshop_x")              # just the token
 veritas.gateway()                                # https://prod.apis.huit.harvard.edu
 
-# Fetches the token on each request (refreshing as needed) and retries once on a 401:
+# Fetches the token on each request, refreshing it as needed:
 quota_url = veritas.gateway() + "/ais-bedrock-llm/apigee/quota"
-httpx.get(quota_url, auth=veritas.Auth(app="awa-workshop_x"))
 requests.get(quota_url, auth=veritas.Auth(app="awa-workshop_x"))
 
 veritas.login(app="awa-workshop_x")              # the browser sign-in, from Python
