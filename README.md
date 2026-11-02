@@ -5,11 +5,7 @@ and uses them to call HUIT AIS proxies, from the command line or from Python.
 
 ## Install
 
-It needs **Python 3.11 or newer** and read access to this repo
-(`harvard-huit/hapi-veritas-cli`, private). pip fetches it with your normal git credentials, so
-if `git clone https://github.com/harvard-huit/hapi-veritas-cli` works for you, so will these. If
-it asks for a password, run `gh auth setup-git` once, or use the `git+ssh://git@github.com/...`
-form of the URL instead.
+It needs **Python 3.11 or newer** and git. The repo is public, so no GitHub login is needed.
 
 **As a command (recommended).** [pipx](https://pipx.pypa.io) puts `veritas` on your PATH in its
 own isolated environment:
