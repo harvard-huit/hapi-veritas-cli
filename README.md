@@ -1,18 +1,46 @@
 # veritas CLI
 
 The `veritas` command gets OAuth tokens from the Apigee authorization server (`adex-oauth2-as`)
-and uses them to call HUIT AIS proxies. This is workstream 1 of the hackathon; the spec is
-[`../01-cli.md`](../01-cli.md).
+and uses them to call HUIT AIS proxies, from the command line or from Python.
 
 ## Install
 
+It needs **Python 3.11 or newer** and read access to this repo
+(`harvard-huit/hapi-veritas-cli`, private). pip fetches it with your normal git credentials, so
+if `git clone https://github.com/harvard-huit/hapi-veritas-cli` works for you, so will these. If
+it asks for a password, run `gh auth setup-git` once, or use the `git+ssh://git@github.com/...`
+form of the URL instead.
+
+**As a command (recommended).** [pipx](https://pipx.pypa.io) puts `veritas` on your PATH in its
+own isolated environment:
+
 ```bash
-cd veritas-cli
+pipx install git+https://github.com/harvard-huit/hapi-veritas-cli.git
+veritas --version
+```
+
+Upgrade with `pipx upgrade veritas-cli`, remove with `pipx uninstall veritas-cli`. No pipx?
+`brew install pipx` on macOS, `python3 -m pip install --user pipx` elsewhere, then
+`pipx ensurepath` and open a new terminal.
+
+**As a library** for your own scripts or notebooks (`import veritas`), install it into that
+project's virtual environment instead:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install git+https://github.com/harvard-huit/hapi-veritas-cli.git
+```
+
+Add `@<branch-or-tag>` to the end of the URL to pin a version, e.g.
+`...hapi-veritas-cli.git@stage`. Without it you get the default branch, `development`.
+
+**To work on the CLI itself:**
+
+```bash
+git clone https://github.com/harvard-huit/hapi-veritas-cli.git && cd hapi-veritas-cli
 python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
 .venv/bin/veritas --help
 ```
-
-It needs Python 3.11 or newer.
 
 ## Use it
 
@@ -113,10 +141,9 @@ for curl tests (cents per hour) will stop a session on its first request with a 
 Everything works on Windows. The examples above are bash; in PowerShell:
 
 ```powershell
-cd veritas-cli
-py -3.12 -m venv .venv
-.venv\Scripts\pip install -e .
-.venv\Scripts\Activate.ps1
+py -3.12 -m pip install --user pipx
+py -3.12 -m pipx ensurepath                    # then open a new terminal
+pipx install git+https://github.com/harvard-huit/hapi-veritas-cli.git
 
 $env:VERITAS_ENV = "dev"                       # instead of: export VERITAS_ENV=dev
 veritas login --app awa-veritas_cli
