@@ -1,3 +1,4 @@
+import os
 import stat
 
 import pytest
@@ -62,8 +63,9 @@ def test_file_store_round_trip_and_permissions(isolated_home):
     assert store.get("stage", "awa-cli") is None
 
     tokens_file = isolated_home / "tokens.json"
-    assert stat.S_IMODE(tokens_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(isolated_home.stat().st_mode) == 0o700
+    if os.name != "nt":   # Windows does not enforce POSIX modes; the profile directory is private
+        assert stat.S_IMODE(tokens_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(isolated_home.stat().st_mode) == 0o700
 
     store.delete("dev", "awa-cli")
     assert store.get("dev", "awa-cli") is None

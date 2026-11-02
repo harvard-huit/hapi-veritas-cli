@@ -2,6 +2,7 @@ import base64
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlsplit
 
@@ -135,24 +136,33 @@ def free_port():
 
 def run_receiver(redirect_uri, state, requests_to_send):
     outcome = {}
+    # No proxies: on macOS urllib reads the system proxy settings, and a proxied request to
+    # 127.0.0.1 never reaches the listener (seen on GitHub's macOS runners).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def send_requests():
         for path in requests_to_send:
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).read()
-            except Exception:
-                pass
+                opener.open(f"http://127.0.0.1:{port}{path}", timeout=5).read()
+            except urllib.error.HTTPError:
+                pass   # the 404 for /favicon.ico is expected
+            except Exception as problem:
+                outcome.setdefault("send_errors", []).append(f"{path}: {problem!r}")
 
     port = parse_redirect_uri(redirect_uri)[0]
 
     def receive():
-        outcome["result"] = receive_callback(redirect_uri, state, timeout=10,
-                                             on_ready=lambda: threading.Thread(
-                                                 target=send_requests).start())
+        try:
+            outcome["result"] = receive_callback(redirect_uri, state, timeout=10,
+                                                 on_ready=lambda: threading.Thread(
+                                                     target=send_requests).start())
+        except Exception as problem:
+            outcome["error"] = repr(problem)
 
     receiver = threading.Thread(target=receive)
     receiver.start()
     receiver.join(15)
+    assert "result" in outcome, f"receiver failed: {outcome}"
     return outcome["result"]
 
 
@@ -162,6 +172,37 @@ def test_loopback_returns_code_and_ignores_other_paths():
                           ["/favicon.ico", "/callback?code=abc123&state=good-state"])
     assert result.code == "abc123"
     assert result.error is None
+
+
+def test_loopback_survives_a_connection_that_never_sends(monkeypatch):
+    # A browser preconnect: a socket that connects and says nothing. The real redirect after it
+    # must still be read.
+    port = free_port()
+    idle = []
+
+    def connect_silently_then_redirect():
+        idle.append(socket.create_connection(("127.0.0.1", port)))
+        return "/callback?code=after-idle&state=good-state"
+
+    outcome = {}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def on_ready():
+        def send():
+            path = connect_silently_then_redirect()
+            opener.open(f"http://127.0.0.1:{port}{path}", timeout=15).read()
+        threading.Thread(target=send).start()
+
+    def receive():
+        outcome["result"] = receive_callback(f"http://localhost:{port}/callback", "good-state",
+                                             timeout=20, on_ready=on_ready)
+
+    receiver = threading.Thread(target=receive)
+    receiver.start()
+    receiver.join(25)
+    for connection in idle:
+        connection.close()
+    assert outcome["result"].code == "after-idle"
 
 
 def test_loopback_rejects_wrong_state():

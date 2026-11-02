@@ -2,36 +2,38 @@
 
 import json
 import os
+import re
+import shlex
+import shutil
+import subprocess
 import sys
 import time
-import webbrowser
 from datetime import datetime
 from urllib.parse import urlsplit
 
 import click
 import httpx
 
-from . import __version__, pkce
-from .oauth import (DEFAULT_REDIRECT_URI, AuthServer, LoopbackError, OAuthError,
-                    receive_callback)
+from . import __version__
+from . import client as core
+from .client import VeritasError
+from .oauth import DEFAULT_REDIRECT_URI, OAuthError
 from .stacks import DEFAULT_STACK, KNOWN_STACKS, StackError, resolve
-from .store import StoreError, TokenStore
-
-# Refresh this long before the AS says the token expires, so a token is never handed out with
-# only a second or two of life left.
-EXPIRY_SKEW_SECONDS = 60
-DEFAULT_QUOTA_PROXY = "ais-openai-direct-v2"
+from .store import StoreError, veritas_home, write_private_json
+# The proxy BASE PATH, not its name: ais-openai-direct-v2 is served at /ais-openai-direct/v2.
+DEFAULT_QUOTA_BASE_PATH = "/ais-openai-direct/v2"
 # Response headers worth showing next to a `call`: the AIS quota and Apigee rate-limit ones.
 QUOTA_HEADER_MARKERS = ("quota", "ratelimit", "x-ais", "remaining")
-
-
-def auth_server(stack):
-    """Factory, so tests can swap the HTTP transport."""
-    return AuthServer(stack)
-
-
-def token_store():
-    return TokenStore()
+# `veritas claude`: Claude Code in Bedrock mode, pointed at the gateway's pass-through Bedrock proxy.
+BEDROCK_PROXY_PATH = "/ais-bedrock-llm/v2"
+DEFAULT_BEDROCK_REGION = "us-east-1"
+# Credentials Claude Code would prefer over the gateway token, or send in its place. Removed from
+# the child's environment so a key exported in a profile can't silently win.
+COMPETING_CLAUDE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+                                "AWS_BEARER_TOKEN_BEDROCK")
+# Windows has no exec: os.execve there starts a SEPARATE process and returns, leaving veritas and
+# Claude Code fighting over one console, and it cannot run npm's claude.cmd at all.
+WINDOWS = os.name == "nt"
 
 
 # --- helpers ----------------------------------------------------------------------------------
@@ -57,58 +59,30 @@ def describe_time(epoch):
     return f"{stamp} (in {remaining // 86400}d)"
 
 
-def is_expired(epoch, skew=EXPIRY_SKEW_SECONDS):
-    return bool(epoch) and time.time() >= epoch - skew
-
-
 def resolve_client(store, stack, app):
-    client = app or store.active_client(stack)
-    if not client:
-        fail(f"no client for {stack}: run `veritas login -e {stack} --app <APP NAME>` "
-             f"(or `veritas m2m`), or pass --app")
-    return client
-
-
-def fresh_record(store, stack, client):
-    """The stored token for (stack, client), refreshed first if it has expired."""
-    record = store.get(stack, client)
-    if not record:
-        fail(f"no token for {client} on {stack}: run `veritas login -e {stack} --app {client}`")
-    if not is_expired(record.get("expires_at")):
-        return record
-    if record.get("grant") == "client_credentials":
-        fail(f"the m2m token for {client} on {stack} expired and client_credentials has no "
-             f"refresh token: run `veritas m2m -e {stack}` again")
-    refresh_token = record.get("refresh_token")
-    if not refresh_token or is_expired(record.get("refresh_expires_at"), skew=0):
-        fail(f"the session for {client} on {stack} expired: run "
-             f"`veritas login -e {stack} --app {client}`")
     try:
-        refreshed = auth_server(stack).refresh(client, refresh_token)
-    except OAuthError as problem:
-        fail(f"refresh failed (HTTP {problem.status}); run `veritas login -e {stack} "
-             f"--app {client}`", problem.body)
-    store.put(stack, client, refreshed)
-    return refreshed
+        return core.resolve_client(store, stack, app)
+    except VeritasError as problem:
+        fail(str(problem), problem.body)
 
 
-def _default_stack_name():
+def fresh_record(store, stack, client, force_refresh=False):
     try:
-        return token_store().default_stack() or DEFAULT_STACK
-    except StoreError:
-        return DEFAULT_STACK
+        return core.fresh_record(store, stack, client, force_refresh=force_refresh)
+    except VeritasError as problem:
+        fail(str(problem), problem.body)
 
 
 def _resolve_stack(context, parameter, stack_name):
     try:
-        return resolve(stack_name, token_store().stack_config())
+        return resolve(stack_name, core.token_store().stack_config())
     except StackError as problem:
         raise click.BadParameter(str(problem), ctx=context, param=parameter)
 
 
 def with_stack(command):
     return click.option(
-        "-e", "--env", "stack", envvar="VERITAS_ENV", default=_default_stack_name,
+        "-e", "--env", "stack", envvar="VERITAS_ENV", default=core.default_stack_name,
         callback=_resolve_stack, metavar="STACK",
         help=f"Stack to talk to: {', '.join(KNOWN_STACKS)}, or any stack configured in "
              f"config.json. Default: VERITAS_ENV, then config default_stack, then "
@@ -146,47 +120,13 @@ def login(stack, app, port, redirect_uri, scope, resource, no_browser, timeout):
     --app is the Apigee APP NAME of a native (mcp-type) client. There is no secret: the AS
     resolves the name and authenticates the app itself.
     """
-    store = token_store()
-    client = resolve_client(store, stack, app)
-    if port and redirect_uri:
-        fail("pass --port or --redirect-uri, not both")
-    if not redirect_uri:
-        redirect_uri = DEFAULT_REDIRECT_URI if not port else f"http://localhost:{port}/callback"
-
-    server = auth_server(stack)
-    verifier = pkce.make_verifier()
-    state = pkce.make_state()
-    sign_in_url = server.authorize_url(client, redirect_uri, pkce.challenge_for(verifier), state,
-                                       scope=scope, resource=resource)
-
-    def open_sign_in():
-        if no_browser:
-            click.echo(f"Open this URL to sign in:\n\n  {sign_in_url}\n", err=True)
-        else:
-            click.echo(f"Opening the browser to sign in to {stack} as {client} ...", err=True)
-            if not webbrowser.open(sign_in_url):
-                click.echo(f"Could not open a browser. Open this URL:\n\n  {sign_in_url}\n",
-                           err=True)
-        click.echo(f"Waiting for the redirect on {redirect_uri} ...", err=True)
-
     try:
-        callback = receive_callback(redirect_uri, state, timeout=timeout, on_ready=open_sign_in)
-    except LoopbackError as problem:
-        fail(str(problem))
-    if callback.error:
-        hint = ""
-        if callback.error == "access_denied":
-            hint = " (usually: you are not in a Grouper group that authorizes this app)"
-        fail(f"sign-in failed: {callback.error}{hint}", callback.error_description)
-
-    try:
-        record = server.exchange_code(client, callback.code, redirect_uri, verifier)
-    except OAuthError as problem:
-        fail(f"code exchange failed (HTTP {problem.status}). A redirect_uri_mismatch means the "
-             f"app's registered callback is not {redirect_uri}", problem.body)
-
-    store.put(stack, client, record)
-    store.set_active_client(stack, client)
+        record = core.login(stack, app, port=port, redirect_uri=redirect_uri, scope=scope,
+                            resource=resource, open_browser=not no_browser, timeout=timeout,
+                            notify=lambda message: click.echo(message, err=True))
+    except VeritasError as problem:
+        fail(str(problem), problem.body)
+    client = record["client"]
     click.echo(f"Signed in to {stack} as {client}.")
     click.echo(f"  access token expires   {describe_time(record['expires_at'])}")
     click.echo(f"  refresh token expires  {describe_time(record['refresh_expires_at'])}")
@@ -208,11 +148,11 @@ def m2m(stack, client_id, secret_env, scope, resource):
     if not client_secret:
         fail(f"${secret_env} is empty: export the app's consumerSecret in it")
     try:
-        record = auth_server(stack).client_credentials(client_id, client_secret, scope=scope,
+        record = core.auth_server(stack).client_credentials(client_id, client_secret, scope=scope,
                                                        resource=resource)
     except OAuthError as problem:
         fail(f"client_credentials failed (HTTP {problem.status})", problem.body)
-    store = token_store()
+    store = core.token_store()
     store.put(stack, client_id, record)
     store.set_active_client(stack, client_id)
     click.echo(f"m2m token stored for {record.get('application_name') or client_id} on {stack}; "
@@ -222,11 +162,26 @@ def m2m(stack, client_id, secret_env, scope, resource):
 @main.command()
 @with_stack
 @with_app
-def token(stack, app):
+@click.option("--refresh", "force_refresh", is_flag=True,
+              help="Refresh now, even if the access token is still valid (e.g. to test what a "
+                   "refresh does after a permission change).")
+def token(stack, app, force_refresh):
     """Print a valid access token (refreshing it if needed). For $(veritas token)."""
-    store = token_store()
-    record = fresh_record(store, stack, resolve_client(store, stack, app))
+    store = core.token_store()
+    record = fresh_record(store, stack, resolve_client(store, stack, app), force_refresh=force_refresh)
+    if force_refresh:
+        click.echo(f"refreshed: access token expires {describe_time(record['expires_at'])}", err=True)
     click.echo(record["access_token"])
+
+
+@main.command()
+@with_stack
+@with_app
+def header(stack, app):
+    """Print `Authorization: Bearer <token>`, refreshed if needed. For curl -H "$(veritas header)"."""
+    store = core.token_store()
+    record = fresh_record(store, stack, resolve_client(store, stack, app))
+    click.echo(f"Authorization: Bearer {record['access_token']}")
 
 
 @main.command("env")
@@ -234,7 +189,7 @@ def token(stack, app):
 @with_app
 def env_command(stack, app):
     """Print `export ACCESS_TOKEN=...` for eval."""
-    store = token_store()
+    store = core.token_store()
     record = fresh_record(store, stack, resolve_client(store, stack, app))
     click.echo(f"export ACCESS_TOKEN='{record['access_token']}'")
 
@@ -244,7 +199,7 @@ def env_command(stack, app):
 @with_app
 def whoami(stack, app):
     """Show who the token is for: the local record, then what /userinfo says."""
-    store = token_store()
+    store = core.token_store()
     client = resolve_client(store, stack, app)
     record = fresh_record(store, stack, client)
     click.echo(f"stack    {stack}")
@@ -255,7 +210,7 @@ def whoami(stack, app):
         click.echo("user     none: an m2m token carries no user, so only the app quota applies")
         return
     try:
-        claims = auth_server(stack).userinfo(record["access_token"])
+        claims = core.auth_server(stack).userinfo(record["access_token"])
     except OAuthError as problem:
         fail(f"/userinfo refused (HTTP {problem.status})", problem.body)
     click.echo("userinfo")
@@ -323,7 +278,7 @@ def call(stack, app, target, method, data, headers, any_host):
     Exits 1 on an HTTP error status.
     """
     url = _target_url(stack, target, any_host)
-    store = token_store()
+    store = core.token_store()
     record = fresh_record(store, stack, resolve_client(store, stack, app))
     body = _read_data(data)
     method = (method or ("POST" if body is not None else "GET")).upper()
@@ -345,15 +300,16 @@ def call(stack, app, target, method, data, headers, any_host):
 @main.command()
 @with_stack
 @with_app
-@click.option("--proxy", default=DEFAULT_QUOTA_PROXY, show_default=True,
-              help="AIS proxy whose quota to read (each has its own quota name): "
-                   "ais-openai-direct-v2, ais-google-gemini, ais-bedrock-llm, "
-                   "ais-openai-direct-hdsi, ais-openai-direct-comdev.")
-def quota(stack, app, proxy):
-    """Show the app's quota and what is left, from GET /<proxy>/apigee/quota."""
-    store = token_store()
+@click.argument("base_path", default=DEFAULT_QUOTA_BASE_PATH, required=False)
+def quota(stack, app, base_path):
+    """Show the app's quota, and the user's when the token carries one, from
+    GET <BASE_PATH>/apigee/quota. BASE_PATH is the proxy's base path, not its name. Each
+    quota name has its own counters. Today's AIS base paths: /ais-openai-direct/v2 (default),
+    /ais-openai-direct-hdsi/v2, /ais-openai-direct-comdev/v2, /ais-google-gemini,
+    /ais-bedrock-llm."""
+    store = core.token_store()
     record = fresh_record(store, stack, resolve_client(store, stack, app))
-    url = f"{stack.gateway_base}/{proxy}/apigee/quota"
+    url = f"{stack.gateway_base}/{base_path.strip('/')}/apigee/quota"
     response = _send(record["access_token"], "GET", url, (), None)
     try:
         payload = response.json()
@@ -369,7 +325,7 @@ def quota(stack, app, proxy):
 @with_app
 def logout(stack, app):
     """Forget the stored token for the client (the active one by default)."""
-    store = token_store()
+    store = core.token_store()
     client = resolve_client(store, stack, app)
     store.delete(stack, client)
     if store.active_client(stack) == client:
@@ -382,11 +338,86 @@ def logout(stack, app):
 def discover(stack):
     """Print the authorization server's metadata (no credentials needed)."""
     try:
-        click.echo(json.dumps(auth_server(stack).metadata(), indent=2))
+        click.echo(json.dumps(core.auth_server(stack).metadata(), indent=2))
     except OAuthError as problem:
         fail(f"discovery failed (HTTP {problem.status})", problem.body)
     except httpx.HTTPError as problem:
         fail(f"discovery failed: {problem}")
+
+
+def claude_environment(stack, base_environment):
+    """The environment Claude Code runs with: Bedrock mode against the stack's gateway, no AWS
+    signing (the gateway authenticates), and no competing credential."""
+    environment = {name: value for name, value in base_environment.items()
+                   if name not in COMPETING_CLAUDE_CREDENTIALS}
+    environment.update({
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "ANTHROPIC_BEDROCK_BASE_URL": f"{stack.gateway_base}{BEDROCK_PROXY_PATH}",
+    })
+    environment.setdefault("AWS_REGION", DEFAULT_BEDROCK_REGION)
+    return environment
+
+
+def helper_command(stack, client, windows=WINDOWS):
+    """The apiKeyHelper command line: this same CLI by interpreter path, so it works without
+    `veritas` on PATH and in whatever virtualenv this one runs from. On Windows, Claude Code may run
+    the helper through cmd.exe or Git Bash; double-quoted arguments and a forward-slash path read
+    the same in both (bash would eat unquoted backslashes, cmd ignores single quotes)."""
+    arguments = [sys.executable, "-m", "veritas.cli", "token", "-e", stack.name, "--app", client]
+    if not windows:
+        return shlex.join(arguments)
+    arguments[0] = arguments[0].replace("\\", "/")
+    return " ".join(f'"{argument}"' for argument in arguments)
+
+
+def claude_settings_file(stack, client, windows=WINDOWS):
+    """Write Claude Code's settings for this stack and client, and return the file's path.
+
+    apiKeyHelper is how Claude Code refreshes a gateway token mid-session: it re-runs the helper
+    (every 5 minutes, and on a 401) and sends the output as `Authorization: Bearer`. The settings go
+    in a FILE rather than an inline JSON argument because cmd.exe, which runs npm's claude.cmd on
+    Windows, mangles the quotes in an inline JSON string. One file per stack and client, so two
+    sessions on different apps never rewrite each other's helper."""
+    safe_client = re.sub(r"[^A-Za-z0-9._-]", "_", client)
+    path = veritas_home() / "claude" / f"{stack.name}-{safe_client}.json"
+    write_private_json(path, {"apiKeyHelper": helper_command(stack, client, windows)})
+    return path
+
+
+def launch(arguments, environment, windows=WINDOWS):
+    """Replace this process with Claude Code; on Windows, run it as a child and exit with its code."""
+    if not windows:
+        os.execve(arguments[0], arguments, environment)
+    process = subprocess.Popen(arguments, env=environment)
+    while True:
+        try:
+            sys.exit(process.wait())
+        except KeyboardInterrupt:
+            continue   # Ctrl+C belongs to Claude Code, which shares the console; keep waiting
+
+
+@main.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@with_stack
+@with_app
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def claude(stack, app, claude_args):
+    """Run Claude Code through the stack's Bedrock proxy as you, on your user token.
+
+    Every call is charged to your per-user AI Services limit inside the app's. Arguments after the
+    veritas options go to claude unchanged, e.g. `veritas claude -e dev -p "hello"` or
+    `veritas claude -e dev --model us.anthropic.claude-sonnet-5-5`."""
+    store = core.token_store()
+    client = resolve_client(store, stack, app)
+    record = fresh_record(store, stack, client)   # fail here, before launching, if not signed in
+    if record.get("grant") == "client_credentials":
+        fail(f"{client} holds an m2m token, which names no user: sign in with "
+             f"`veritas login -e {stack} --app <APP NAME>`")
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        fail("claude (Claude Code) is not on PATH: install it first")
+    arguments = [claude_path, "--settings", str(claude_settings_file(stack, client)), *claude_args]
+    launch(arguments, claude_environment(stack, os.environ))
 
 
 def run():
