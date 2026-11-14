@@ -150,8 +150,10 @@ session outlasts the one-hour token. That command takes priority over an `OPENAI
 
 Codex shows one startup warning: `Running without the shared background server: command-line
 configuration overrides ... requires embedded mode.` It is harmless. Codex runs its own server for
-the session instead of sharing one with the IDE extension or desktop app. Every way of setting
-config on the command line causes it, `--profile` included. To use the shared server, put the
+the session instead of the shared one. The session is still saved, so `codex resume` and
+`codex fork` work. What you lose is reaching the session *while it runs* from somewhere else:
+`codex agents`, `codex queue`, remote control, or the desktop app. Every way of setting config
+on the command line causes the warning, `--profile` included. To use the shared server, put the
 provider in `~/.codex/config.toml` with `--print-config` (below), select it there, and start
 plain `codex`.
 
