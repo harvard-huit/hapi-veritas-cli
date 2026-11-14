@@ -181,7 +181,9 @@ a Codex started from the IDE or the Dock; `--install-config` warns when one is s
 block yourself instead, `--print-config` prints it with instructions.
 
 veritas sets no model here either. Codex uses the `model` from your config or `-m`, and the proxy
-has to allow it. Every request is charged to your **per-user** OpenAI limit, inside the app's.
+has to allow it. A config that `--install-config` creates from scratch has no `model` line, so
+Codex picks its own default, which changes between Codex releases and decides what each request
+costs. Set `model = "..."` in `config.toml` or pass `-m` to choose. Every request is charged to your **per-user** OpenAI limit, inside the app's.
 Codex retries a failed request up to 5 times by default, so a per-user limit sized for curl tests
 will be hit fast.
 
