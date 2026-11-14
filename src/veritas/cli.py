@@ -394,7 +394,7 @@ def claude_settings_file(stack, client, windows=WINDOWS):
     Windows, mangles the quotes in an inline JSON string. One file per stack and client, so two
     sessions on different apps never rewrite each other's helper."""
     safe_client = re.sub(r"[^A-Za-z0-9._-]", "_", client)
-    if safe_client != client:   # keep "my app" and "my_app" apart
+    if safe_client != client or client != client.lower():   # "my app" vs "my_app", "MyApp" vs "myapp"
         safe_client += "-" + hashlib.sha256(client.encode()).hexdigest()[:8]
     path = veritas_home() / "claude" / f"{stack.name}-{safe_client}.json"
     write_private_json(path, {"apiKeyHelper": helper_command(stack, client, windows)})
@@ -452,17 +452,20 @@ def delayed_expansion_enabled(windows=WINDOWS):
                 value, _ = winreg.QueryValueEx(key, "DelayedExpansion")
         except OSError:
             continue   # no key or no value in this hive: ask the next one
-        return value == 1
+        try:
+            return int(value) != 0
+        except (TypeError, ValueError):
+            return True   # a value cmd.exe might read as on: refuse `!` rather than risk it
     return False
 
 
-def cmd_shim_problem(arguments, delayed_expansion=False):
-    """The first argument cmd.exe would misread, with the offending characters, when the target is
-    a .cmd/.bat shim; None when the launch is safe."""
+def cmd_shim_problem(arguments, delayed_expansion=False, first=0):
+    """The first argument (from index ``first``) cmd.exe would misread, with the offending
+    characters, when the target is a .cmd/.bat shim; None when the launch is safe."""
     if os.path.splitext(arguments[0])[1].lower() not in (".cmd", ".bat"):
         return None
     unsafe = CMD_METACHARACTERS | {"!"} if delayed_expansion else CMD_METACHARACTERS
-    for argument in arguments:
+    for argument in arguments[first:]:
         found = sorted(unsafe & set(argument))
         if found:
             return argument, found
@@ -534,18 +537,20 @@ def claude(stack, app, claude_args):
     client = resolve_client(store, stack, app)
     user_record(store, stack, client)
     if WINDOWS:
-        unsafe = sorted(HELPER_UNSAFE_CHARACTERS & set(client)) or \
-            [character for character in client if ord(character) < 0x20]
-        if unsafe:
-            fail(f"app name {client!r} holds {' '.join(map(repr, unsafe))}, which cmd.exe or Git Bash "
-                 f"would expand in Claude Code's token helper: veritas claude can't use this app on "
-                 f"Windows (veritas codex --install-config can)")
+        for what, value in (("app name", client), ("Python path", sys.executable)):
+            unsafe = sorted(HELPER_UNSAFE_CHARACTERS & set(value) - {"\\"} if what == "Python path"
+                            else HELPER_UNSAFE_CHARACTERS & set(value)) or \
+                [character for character in value if ord(character) < 0x20]
+            if unsafe:
+                fail(f"{what} {value!r} holds {' '.join(map(repr, unsafe))}, which cmd.exe or Git Bash "
+                     f"would expand in Claude Code's token helper: veritas claude can't run this way "
+                     f"on Windows (veritas codex --install-config can)")
     claude_path = find_program("claude")
     if not claude_path:
         fail("claude (Claude Code) is not on PATH: install it first")
     settings_path = str(claude_settings_file(stack, client))
     own_problem = cmd_shim_problem([claude_path, "--settings", settings_path],
-                                   delayed_expansion_enabled()) if WINDOWS else None
+                                   delayed_expansion_enabled(WINDOWS), first=1) if WINDOWS else None
     if own_problem:
         fail(f"veritas's own settings path {own_problem[0]!r} holds "
              f"{describe_cmd_problem(own_problem[1])}, which cmd.exe (running "
@@ -892,7 +897,8 @@ def codex(stack, app, install_config, print_config, codex_args):
     if not codex_path:
         fail("codex (OpenAI Codex CLI) is not on PATH: install it first, or use "
              f"`veritas codex -e {stack} --install-config` to configure the IDE extension")
-    own_problem = cmd_shim_problem([codex_path, *overrides], delayed_expansion_enabled()) if WINDOWS else None
+    own_problem = cmd_shim_problem([codex_path, *overrides], delayed_expansion_enabled(WINDOWS),
+                                   first=1) if WINDOWS else None
     if own_problem:
         fail(f"veritas's own setting {own_problem[0]!r} holds {describe_cmd_problem(own_problem[1])}, "
              f"which cmd.exe (running {os.path.basename(codex_path)}) would misread. Run "

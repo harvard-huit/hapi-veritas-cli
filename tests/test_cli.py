@@ -468,6 +468,51 @@ def test_exclamation_marks_pass_unless_delayed_expansion_is_on(monkeypatch):
     assert exited.value.code == 1 and not started
 
 
+@pytest.mark.parametrize("value, enabled", [(1, True), (2, True), (0, False), ("1", True), ("0", False),
+                                            ("yes", True)])
+def test_delayed_expansion_reads_any_nonzero_or_unclear_value_as_on(monkeypatch, value, enabled):
+    monkeypatch.setitem(sys.modules, "winreg", FakeRegistry({"HKCU": {"DelayedExpansion": value}}))
+    assert cli.delayed_expansion_enabled(windows=True) is enabled
+
+
+def test_own_setting_checks_dont_blame_the_tools_own_path(monkeypatch, token_endpoint):
+    signed_in()
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli, "find_program", lambda name: r"C:\Users\AT&T\npm\%s.cmd" % name)
+    launched = []
+    monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.append(arguments))
+    for command in ("claude", "codex"):
+        result = CliRunner().invoke(cli.main, [command, "-e", "dev"])
+        assert "own setting" not in result.output, result.output
+    assert len(launched) == 2   # launch() itself names claude.cmd/codex.cmd as the problem
+
+
+def test_codex_own_setting_check_refuses_bang_when_delayed_expansion_is_on(monkeypatch, token_endpoint):
+    signed_in()
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setitem(sys.modules, "winreg", FakeRegistry({"HKCU": {"DelayedExpansion": 1}}))
+    monkeypatch.setattr(cli.sys, "executable", r"C:\Users\wow!\venv\Scripts\python.exe")
+    monkeypatch.setattr(cli, "find_program", lambda name: r"C:\npm\codex.cmd")
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev"])
+    assert result.exit_code == 1 and "own setting" in result.output and "DelayedExpansion" in result.output
+
+
+def test_claude_on_windows_refuses_a_python_path_its_helper_shell_would_expand(monkeypatch, token_endpoint):
+    signed_in()
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli.sys, "executable", r"C:\Users\jo$h\venv\Scripts\python.exe")
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["claude", "-e", "dev"])
+    assert result.exit_code == 1 and "Python path" in result.output
+
+
+def test_settings_files_for_names_differing_only_in_case_dont_collide(isolated_home):
+    upper = cli.claude_settings_file(resolve("dev"), "MyApp")
+    lower = cli.claude_settings_file(resolve("dev"), "myapp")
+    assert upper.name.lower() != lower.name.lower()
+
+
 def test_delayed_expansion_message_names_the_setting(capsys):
     assert "DelayedExpansion=1" in cli.describe_cmd_problem(["!"])
     assert "DelayedExpansion" not in cli.describe_cmd_problem(["&"])
