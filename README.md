@@ -148,6 +148,13 @@ token from the veritas store. Codex re-runs the command every 5 minutes and afte
 session outlasts the one-hour token. That command takes priority over an `OPENAI_API_KEY` or
 `CODEX_API_KEY` in your environment.
 
+Codex shows one startup warning: `Running without the shared background server: command-line
+configuration overrides ... requires embedded mode.` It is harmless. Codex runs its own server for
+the session instead of sharing one with the IDE extension or desktop app. Every way of setting
+config on the command line causes it, `--profile` included. To use the shared server, put the
+provider in `~/.codex/config.toml` with `--print-config` (below), select it there, and start
+plain `codex`.
+
 **The IDE extension and the desktop app** start Codex themselves, so veritas can't pass it flags.
 Add the provider to `~/.codex/config.toml` once:
 
