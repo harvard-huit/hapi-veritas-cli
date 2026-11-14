@@ -149,9 +149,12 @@ session outlasts the one-hour token. That command takes priority over an `OPENAI
 `CODEX_API_KEY` in your environment. The command runs Python with `-P`, so a `veritas/` or
 `click.py` in the project you have open can't run in place of veritas.
 
-**Put the veritas options (`-e`, `--app`) first.** veritas stops reading options at codex's first
-argument, so from there on everything reaches codex unchanged, its own `-e`, `--help` and `--`
-included: `veritas codex -e dev exec --help` is codex's help.
+**Put the veritas options (`-e`, `--app`) first, before any codex option.** veritas reads its
+own options up to the first word that isn't an option (`exec`, a prompt) and passes everything
+from there on to codex unchanged, its own `-e`, `--help` and `--` included:
+`veritas codex -e dev exec --help` is codex's help. A codex flag placed before that word doesn't
+stop veritas reading, so `veritas codex -m gpt-5 -e dev` hands `-e dev` to codex and runs on your
+default stack; write `veritas codex -e dev -m gpt-5`. `veritas claude` works the same way.
 
 Codex shows one startup warning: `Running without the shared background server: command-line
 configuration overrides ... requires embedded mode.` It is harmless. Codex runs its own server for
@@ -168,16 +171,26 @@ Install the provider in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) in
 veritas codex -e dev --app awa-veritas_cli --install-config
 ```
 
-This adds a `[model_providers.veritas-dev]` block marked as managed by veritas, and sets the
-top-level `model_provider = 'veritas-dev'` so plain `codex`, the IDE extension and the desktop app
-all use it. It says which provider it replaced, so you can set that back to switch, and keeps the
-previous file as `config.toml.bak-veritas`. Running it again (after reinstalling veritas, or for
-another app on the same stack) replaces the block instead of adding a second one. It checks that
-the file is valid TOML before and after, and leaves the file alone if it isn't. The block holds
-the path of the Python veritas runs from, and no token or secret.
+This adds the `[model_providers.veritas-dev]` and `[model_providers.veritas-dev.auth]` tables
+and sets the top-level `model_provider = 'veritas-dev'`, so plain `codex`, the IDE extension and
+the desktop app all use it. It says which provider it replaced (or that Codex was on its default),
+so you can switch back, and keeps the previous file as `config.toml.bak-veritas-<timestamp>`: one
+per run, so the file from before your first install is never overwritten. Running it again (after
+reinstalling veritas, or for another app on the same stack) replaces those two tables and nothing
+else; MCP servers, trusted projects and anything else Codex has added stay. veritas checks the
+result by meaning, not just syntax: apart from `model_provider` and its own tables, the new file
+must parse to exactly what the old one held, or nothing is written. A symlinked `config.toml`
+(dotfiles) is written through to its target. The tables hold the path of the Python veritas runs
+from, and no token or secret.
 
-`VERITAS_HOME`, `VERITAS_TOKEN_STORE` and `VERITAS_<STACK>_*_BASE` set in your shell don't reach
-a Codex started from the IDE or the Dock; `--install-config` warns when one is set. To paste the
+A trusted project's own `.codex/config.toml` can still pick another provider for that project.
+If your `config.toml` uses TOML 1.1 syntax that Python's parser can't read (a multi-line inline
+table, say), veritas refuses to edit it; paste the `--print-config` tables in by hand.
+
+`VERITAS_HOME`, `VERITAS_TOKEN_STORE` and `VERITAS_<STACK>_AUTH_BASE` set in your shell don't reach
+a Codex started from the IDE or the Dock, and neither does `CODEX_HOME`. A
+`VERITAS_<STACK>_GATEWAY_BASE` override, on the other hand, is written into the config and stays.
+`--install-config` warns about each of these. To paste the
 block yourself instead, `--print-config` prints it with instructions.
 
 veritas sets no model here either. Codex uses the `model` from your config or `-m`, and the proxy
@@ -216,8 +229,11 @@ veritas claude --model us.anthropic.claude-haiku-4-5-20251001-v1:0
 - **npm installs them as `.cmd` scripts, which cmd.exe re-reads.** veritas refuses to pass an
   argument containing `"`, `%`, `^`, `&`, `|`, `<` or `>` to one, because cmd.exe would misread
   it. Keep those characters out of prompts given on the command line (point the tool at a file
-  instead), or use `veritas codex --install-config` and run `codex` directly. Untested on real
-  Windows so far; the tests run the Windows code paths on every OS.
+  instead), or use `veritas codex --install-config` and run `codex` directly. If the character is
+  in veritas's own settings (`AT&T` in the path of your Python, say), it says so and points you
+  to `--install-config`. Relative PATH entries are skipped as well, and app names are limited to
+  what Apigee allows (letters, digits, spaces, `.`, `-`, `_`). Untested on real Windows so far; the
+  tests run the Windows code paths on every OS.
 - **The tests run on Windows, macOS and Linux in GitHub Actions** (`veritas-cli tests`).
 
 ## Stacks

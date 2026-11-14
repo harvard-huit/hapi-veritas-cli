@@ -459,12 +459,74 @@ def test_install_config_into_an_empty_or_missing_file():
 
 
 @pytest.mark.parametrize("config, message", [
-    ("model = [\n", "not valid TOML"),
-    ("[model_providers.veritas-dev]\nname = 'pasted by hand'\n", "outside the block"),
+    ("model = [\n", "can't read it"),
+    ("[model_providers]\nveritas-dev = { name = 'inline' }\n", "inline table"),
 ])
 def test_install_config_refuses_and_changes_nothing(config, message):
     with pytest.raises(cli.CodexConfigError, match=message):
         cli.install_codex_config(config, resolve("dev"), "awa-cli")
+
+
+def test_install_config_replaces_tables_pasted_from_print_config():
+    import tomllib
+    pasted = MARKS_CONFIG + "\n[model_providers.veritas-dev]\nname = 'pasted by hand'\n" \
+                            "[model_providers.veritas-dev.auth]\ncommand = 'old'\n"
+    text, _ = cli.install_codex_config(pasted, resolve("dev"), "awa-cli")
+    assert text.count("[model_providers.veritas-dev]") == 1
+    assert tomllib.loads(text)["model_providers"]["veritas-dev"]["auth"]["command"] != "old"
+
+
+CODEX_ADDED = """
+[mcp_servers.docs]
+command = "npx"
+args = ["-y", "docs-mcp"]
+
+[projects."/Users/me/other"]
+trust_level = "trusted"
+"""
+
+
+def test_reinstalling_keeps_tables_codex_added_after_the_veritas_ones():
+    import tomllib
+    once, _ = cli.install_codex_config(MARKS_CONFIG, resolve("dev"), "awa-cli")
+    twice, _ = cli.install_codex_config(once + CODEX_ADDED, resolve("dev"), "awa-two")
+    parsed = tomllib.loads(twice)
+    assert parsed["mcp_servers"]["docs"]["args"] == ["-y", "docs-mcp"]
+    assert parsed["projects"]["/Users/me/other"]["trust_level"] == "trusted"
+    assert parsed["model_providers"]["veritas-dev"]["auth"]["args"][-1] == "awa-two"
+
+
+def test_upgrading_the_first_03_block_keeps_what_codex_put_inside_its_markers():
+    """The first 0.3.0 build wrapped its tables in start/end markers, and Codex inserted new tables
+    before the end marker; reinstalling then deleted them. That layout must upgrade cleanly."""
+    import tomllib
+    legacy = MARKS_CONFIG.replace('model_provider = "apigee-prod"', "model_provider = 'veritas-dev'") + (
+        "\n# >>> veritas-dev: managed by `veritas codex --install-config`; edits here are replaced >>>\n"
+        "[model_providers.veritas-dev]\nname = 'old'\n\n[model_providers.veritas-dev.auth]\n"
+        "command = 'old'\n" + CODEX_ADDED + "# <<< veritas-dev <<<\n")
+    text, _ = cli.install_codex_config(legacy, resolve("dev"), "awa-cli")
+    parsed = tomllib.loads(text)
+    assert parsed["mcp_servers"]["docs"]["command"] == "npx"
+    assert parsed["projects"]["/Users/me/other"]["trust_level"] == "trusted"
+    assert "<<<" not in text and ">>>" not in text
+    assert text.count("[model_providers.veritas-dev]") == 1
+
+
+def test_installing_a_second_stack_leaves_the_first_alone():
+    import tomllib
+    dev, _ = cli.install_codex_config(MARKS_CONFIG, resolve("dev"), "awa-cli")
+    both, previous = cli.install_codex_config(dev, resolve("stage"), "awa-cli")
+    parsed = tomllib.loads(both)
+    assert previous == "veritas-dev" and parsed["model_provider"] == "veritas-stage"
+    assert set(parsed["model_providers"]) == {"apigee-prod", "veritas-dev", "veritas-stage"}
+
+
+def test_install_config_keeps_comments_and_crlf_elsewhere():
+    crlf = "# my settings\r\nmodel = 'x'\r\n\r\n# my server\r\n[mcp_servers.a]\r\ncommand = 'a'\r\n"
+    text, previous = cli.install_codex_config(crlf, resolve("dev"), "awa-cli")
+    assert previous is None
+    assert "# my settings" in text and "# my server\r\n[mcp_servers.a]" in text
+    assert "\n" not in text.replace("\r\n", "")
 
 
 def test_install_config_command_writes_codex_home_and_keeps_a_backup(monkeypatch, token_endpoint, tmp_path):
@@ -477,8 +539,14 @@ def test_install_config_command_writes_codex_home_and_keeps_a_backup(monkeypatch
     assert result.exit_code == 0, result.output
     assert "apigee-prod" in result.output
     assert tomllib.loads((tmp_path / "config.toml").read_text())["model_provider"] == "veritas-dev"
-    assert (tmp_path / "config.toml.bak-veritas").read_text() == MARKS_CONFIG
+    backups = list(tmp_path.glob("config.toml.bak-veritas-*"))
+    assert len(backups) == 1 and backups[0].read_text() == MARKS_CONFIG
+    assert cli.WINDOWS or backups[0].stat().st_mode & 0o077 == 0
     assert not list(tmp_path.glob("*.tmp"))
+    # A second install keeps the first backup (the original) and adds its own.
+    again = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--app", "awa-cli", "--install-config"])
+    assert again.exit_code == 0, again.output
+    assert MARKS_CONFIG in [backup.read_text() for backup in tmp_path.glob("config.toml.bak-veritas-*")]
 
 
 def test_install_config_leaves_a_broken_file_alone(monkeypatch, token_endpoint, tmp_path):
@@ -488,16 +556,107 @@ def test_install_config_leaves_a_broken_file_alone(monkeypatch, token_endpoint, 
     result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
     assert result.exit_code == 1 and "unchanged" in result.output
     assert (tmp_path / "config.toml").read_text() == "model = [\n"
-    assert not (tmp_path / "config.toml.bak-veritas").exists()
+    assert not list(tmp_path.glob("config.toml.bak-veritas*"))
+
+
+def test_install_config_writes_through_a_symlink(monkeypatch, token_endpoint, tmp_path):
+    if cli.WINDOWS:
+        pytest.skip("symlinks need privileges on Windows")
+    signed_in()
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    (dotfiles / "codex.toml").write_text(MARKS_CONFIG)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").symlink_to(dotfiles / "codex.toml")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 0, result.output
+    assert (home / "config.toml").is_symlink()
+    assert "veritas-dev" in (dotfiles / "codex.toml").read_text()
+
+
+def test_install_config_accepts_a_bom_and_refuses_utf16_cleanly(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    config = tmp_path / "config.toml"
+    config.write_bytes(b"\xef\xbb\xbf" + MARKS_CONFIG.encode())
+    assert CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"]).exit_code == 0
+    config.write_bytes(MARKS_CONFIG.encode("utf-16"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 1 and "isn't UTF-8" in result.output
+    assert config.read_bytes() == MARKS_CONFIG.encode("utf-16")
+
+
+def test_write_codex_config_refuses_when_the_file_changed_meanwhile(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text("model = 'mine'\n")
+    with pytest.raises(cli.CodexConfigError, match="changed while"):
+        cli.write_codex_config(config, "model = 'veritas'\n", b"model = 'older'\n")
+    assert config.read_text() == "model = 'mine'\n"
+
+
+def test_install_config_says_when_codex_was_on_its_default(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "new-home"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 0, result.output
+    assert "default provider (openai)" in result.output
+    assert "CODEX_HOME is set" in result.output
+
+
+THREE_QUOTES = "'" * 3
+
+
+@pytest.mark.parametrize("text", ["O'Brien", "it'", "a''b", "tab\there", "del\x7fchar",
+                                  "x" + THREE_QUOTES + "y", "\U0001F600 path"])
+def test_toml_value_round_trips_awkward_strings(text):
+    assert toml_literal(cli.toml_value(text)) == text
+
+
+def test_codex_with_an_apostrophe_path_needs_no_double_quotes(monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", r"C:\Users\O'Brien\venv\Scripts\python.exe")
+    overrides = cli.codex_overrides(resolve("dev"), "awa-cli")
+    assert cli.cmd_shim_problem([r"C:\npm\codex.cmd", *overrides]) is None
+
+
+def test_codex_blames_its_own_setting_not_the_prompt(monkeypatch, token_endpoint):
+    signed_in()
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setattr(cli.sys, "executable", r"C:\Users\AT&T\venv\Scripts\python.exe")
+    monkeypatch.setattr(cli, "find_program", lambda name: r"C:\npm\codex.cmd")
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "exec", "hi"])
+    assert result.exit_code == 1 and "veritas's own setting" in result.output
+    assert "--install-config" in result.output
+
+
+def test_find_program_on_windows_skips_relative_path_entries(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / "bin").mkdir(parents=True)
+    (project / "bin" / "codex.cmd").write_text("@echo planted")
+    monkeypatch.chdir(project)
+    environment = {"PATH": "bin;.\\bin", "PATHEXT": ".cmd"}
+    assert cli.find_program("codex", windows=True, environment=environment) is None
+
+
+@pytest.mark.parametrize("app", ["awa-$(id)", "awa`id`", 'awa"x', "awa%PATH%", "-e"])
+def test_tools_refuse_app_names_that_could_reach_a_shell(monkeypatch, token_endpoint, app):
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    for command in ("codex", "claude"):
+        result = CliRunner().invoke(cli.main, [command, "-e", "dev", "--app", app])
+        assert result.exit_code == 1 and "app name" in result.output
 
 
 def test_install_config_warns_about_settings_only_this_shell_has(monkeypatch, token_endpoint, tmp_path):
     signed_in()
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     monkeypatch.setenv("VERITAS_DEV_AUTH_BASE", "https://go.example.edu/oauth2/v1")
+    monkeypatch.setenv("VERITAS_DEV_GATEWAY_BASE", "https://gateway.example.edu")
     result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
     assert result.exit_code == 0, result.output
-    assert "VERITAS_DEV_AUTH_BASE" in result.output
+    assert "VERITAS_DEV_AUTH_BASE set in this shell won't reach" in result.output
+    assert "GATEWAY_BASE is now written into config.toml" in result.output
 
 
 def test_helper_command_on_windows_reads_the_same_in_cmd_and_git_bash(monkeypatch):
