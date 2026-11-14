@@ -1,5 +1,6 @@
 import pathlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -357,6 +358,7 @@ def test_claude_helper_ignores_a_veritas_package_in_the_project(project_shadowin
 
 
 def signed_in(name="awa-cli"):
+    """Store a fresh user token for ``name`` on dev and make it the active client."""
     store = TokenStore()
     store.put("dev", name, stored())
     store.set_active_client("dev", name)
@@ -392,8 +394,9 @@ def test_find_program_on_windows_skips_the_current_directory(tmp_path, monkeypat
     (project / "codex.cmd").write_text("@echo planted")
     (tools / "codex.cmd").write_text("@echo real")
     monkeypatch.chdir(project)
-    environment = {"PATH": f".;{tools}", "PATHEXT": ".exe;.cmd"}
-    assert cli.find_program("codex", windows=True, environment=environment) == str(tools / "codex.cmd")
+    if os.name == "nt":   # a real drive-letter path exists only on Windows
+        environment = {"PATH": f".;{tools}", "PATHEXT": ".exe;.cmd"}
+        assert cli.find_program("codex", windows=True, environment=environment) == str(tools / "codex.cmd")
     assert cli.find_program("codex", windows=True, environment={"PATH": ".", "PATHEXT": ".cmd"}) is None
 
 
@@ -526,7 +529,7 @@ def test_install_config_into_an_empty_or_missing_file():
 
 @pytest.mark.parametrize("config, message", [
     ("model = [\n", "can't read it"),
-    ("[model_providers]\nveritas-dev = { name = 'inline' }\n", "inline table"),
+    ("[model_providers]\nveritas-dev = { name = 'inline' }\n", "an inline, quoted or dotted form"),
 ])
 def test_install_config_refuses_and_changes_nothing(config, message):
     with pytest.raises(cli.CodexConfigError, match=message):
@@ -648,6 +651,8 @@ def test_install_config_accepts_a_bom_and_refuses_utf16_cleanly(monkeypatch, tok
     config = tmp_path / "config.toml"
     config.write_bytes(b"\xef\xbb\xbf" + MARKS_CONFIG.encode())
     assert CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"]).exit_code == 0
+    written = config.read_bytes()
+    assert not written.startswith(b"\xef\xbb\xbf") and b"apigee-prod" in written
     config.write_bytes(MARKS_CONFIG.encode("utf-16"))
     result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
     assert result.exit_code == 1 and "isn't UTF-8" in result.output
@@ -669,6 +674,8 @@ def test_install_config_says_when_codex_was_on_its_default(monkeypatch, token_en
     assert result.exit_code == 0, result.output
     assert "default provider (openai)" in result.output
     assert "CODEX_HOME is set" in result.output
+    monkeypatch.setenv("CODEX_HOME", str(pathlib.Path.home() / ".codex"))
+    assert not any("CODEX_HOME" in caution for caution in cli.config_cautions(resolve("dev")))
 
 
 THREE_QUOTES = "'" * 3
@@ -706,12 +713,104 @@ def test_find_program_on_windows_skips_relative_path_entries(tmp_path, monkeypat
     assert cli.find_program("codex", windows=True, environment=environment) is None
 
 
-@pytest.mark.parametrize("app", ["awa-$(id)", "awa`id`", 'awa"x', "awa%PATH%", "-e"])
-def test_tools_refuse_app_names_that_could_reach_a_shell(monkeypatch, token_endpoint, app):
+@pytest.mark.parametrize("app", ["awa-$(id)", "awa`id`", 'awa"x', "awa%PATH%"])
+def test_claude_on_windows_refuses_app_names_its_helper_shell_would_expand(monkeypatch, token_endpoint, app):
+    signed_in(app)
+    monkeypatch.setattr(cli, "WINDOWS", True)
     monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["claude", "-e", "dev", "--app", app])
+    assert result.exit_code == 1 and "would expand" in result.output
+
+
+@pytest.mark.parametrize("app", ["_tool", "team%x", " spaced", "awa-$(id)"])
+def test_app_names_apigee_allows_work_where_no_shell_sees_them(monkeypatch, token_endpoint, app):
+    signed_in(app)
+    launched = []
+    monkeypatch.setattr(cli, "find_program", lambda name: f"/usr/local/bin/{name}")
+    monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.append(arguments))
     for command in ("codex", "claude"):
         result = CliRunner().invoke(cli.main, [command, "-e", "dev", "--app", app])
-        assert result.exit_code == 1 and "app name" in result.output
+        assert result.exit_code == 0, result.output
+    assert len(launched) == 2
+
+
+def test_claude_settings_files_for_similar_names_dont_collide(isolated_home):
+    first = cli.claude_settings_file(resolve("dev"), "my app")
+    second = cli.claude_settings_file(resolve("dev"), "my_app")
+    assert first != second
+
+
+def test_switching_stacks_back_and_forth_doesnt_grow_the_file():
+    text = MARKS_CONFIG
+    for stack in ("dev", "stage") * 4:
+        text, _ = cli.install_codex_config(text, resolve(stack), "awa-cli")
+    settled = text
+    for stack in ("dev", "stage"):
+        text, _ = cli.install_codex_config(text, resolve(stack), "awa-cli")
+    assert text == settled
+    assert "\n\n\n" not in text
+
+
+def test_an_empty_model_providers_header_is_not_a_reason_to_refuse():
+    import tomllib
+    text, _ = cli.install_codex_config("model = 'x'\n\n[model_providers]\n", resolve("dev"), "awa-cli")
+    assert tomllib.loads(text)["model_providers"]["veritas-dev"]["wire_api"] == "responses"
+
+
+def test_legacy_markers_of_another_stack_are_cleaned_up_too():
+    legacy = ("model_provider = 'veritas-stage'\n\n"
+              "# >>> veritas-stage: managed by `veritas codex --install-config`; edits here are replaced >>>\n"
+              "[model_providers.veritas-stage]\nname = 'old'\n\n[model_providers.veritas-stage.auth]\n"
+              "command = 'old'\n# <<< veritas-stage <<<\n")
+    text, _ = cli.install_codex_config(legacy, resolve("dev"), "awa-cli")
+    assert ">>>" not in text and "<<<" not in text
+    assert "[model_providers.veritas-stage]" in text
+
+
+def test_reinstalling_unchanged_writes_nothing(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(MARKS_CONFIG)
+    assert CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"]).exit_code == 0
+    first = (tmp_path / "config.toml").read_bytes()
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 0 and "already installed" in result.output
+    assert (tmp_path / "config.toml").read_bytes() == first
+    assert len(list(tmp_path.glob("config.toml.bak-veritas-*"))) == 1
+
+
+def test_install_config_reports_os_errors_without_a_traceback(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").mkdir()   # a directory where the file should be
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 1 and "could not update" in result.output
+    assert isinstance(result.exception, SystemExit)
+
+
+@pytest.mark.parametrize("entry", ["bin", ".\\bin", "C:bin", "\\bin"])
+def test_find_program_on_windows_skips_every_non_absolute_form(tmp_path, monkeypatch, entry):
+    monkeypatch.chdir(tmp_path)
+    assert cli.find_program("codex", windows=True, environment={"PATH": entry, "PATHEXT": ".cmd"}) is None
+
+
+@pytest.mark.parametrize("entry, searched", [
+    ("C:\\Program Files\\nodejs", True), ("d:/tools", True), ("\\\\server\\share\\bin", True),
+    ("bin", False), (".\\bin", False), ("C:bin", False), ("\\bin", False), ("%APPDATA%\\npm", False),
+])
+def test_which_windows_path_entries_are_searched(entry, searched):
+    assert bool(cli.WINDOWS_ABSOLUTE_PATH.match(entry)) is searched
+
+
+def test_claude_on_windows_blames_its_own_settings_path(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    monkeypatch.setenv("VERITAS_HOME", str(tmp_path / "AT&T"))
+    signed_in()
+    monkeypatch.setattr(cli, "find_program", lambda name: r"C:\npm\claude.cmd")
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["claude", "-e", "dev"])
+    assert result.exit_code == 1 and "own settings path" in result.output and "VERITAS_HOME" in result.output
 
 
 def test_install_config_warns_about_settings_only_this_shell_has(monkeypatch, token_endpoint, tmp_path):
@@ -742,7 +841,8 @@ def test_helper_command_elsewhere_is_posix_quoted(monkeypatch):
 def test_settings_file_is_per_stack_and_client(isolated_home):
     first = cli.claude_settings_file(resolve("dev"), "awa-one app")
     second = cli.claude_settings_file(resolve("dev"), "awa-two")
-    assert first != second and first.name == "dev-awa-one_app.json"
+    assert first != second and first.name.startswith("dev-awa-one_app-")
+    assert second.name == "dev-awa-two.json"
     assert "awa-one app" in json.loads(first.read_text())["apiKeyHelper"]
 
 

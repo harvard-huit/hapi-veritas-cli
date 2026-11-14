@@ -153,8 +153,10 @@ session outlasts the one-hour token. That command takes priority over an `OPENAI
 own options up to the first word that isn't an option (`exec`, a prompt) and passes everything
 from there on to codex unchanged, its own `-e`, `--help` and `--` included:
 `veritas codex -e dev exec --help` is codex's help. A codex flag placed before that word doesn't
-stop veritas reading, so `veritas codex -m gpt-5 -e dev` hands `-e dev` to codex and runs on your
-default stack; write `veritas codex -e dev -m gpt-5`. `veritas claude` works the same way.
+stop veritas reading either, which is why the order matters: in `veritas codex -m gpt-5 -e dev`,
+`gpt-5` ends the veritas options, so `-e dev` goes to codex (which rejects it) and veritas looks
+for a token on your default stack. Write `veritas codex -e dev -m gpt-5`. `veritas claude` works
+the same way.
 
 Codex shows one startup warning: `Running without the shared background server: command-line
 configuration overrides ... requires embedded mode.` It is harmless. Codex runs its own server for
@@ -175,7 +177,9 @@ This adds the `[model_providers.veritas-dev]` and `[model_providers.veritas-dev.
 and sets the top-level `model_provider = 'veritas-dev'`, so plain `codex`, the IDE extension and
 the desktop app all use it. It says which provider it replaced (or that Codex was on its default),
 so you can switch back, and keeps the previous file as `config.toml.bak-veritas-<timestamp>`: one
-per run, so the file from before your first install is never overwritten. Running it again (after
+per run that changes something, so the file from before your first install is never overwritten.
+They are full copies of your config, including anything else you keep in it (MCP server tokens,
+say); delete the ones you no longer need. Running it when nothing would change writes nothing. Running it again (after
 reinstalling veritas, or for another app on the same stack) replaces those two tables and nothing
 else; MCP servers, trusted projects and anything else Codex has added stay. veritas checks the
 result by meaning, not just syntax: apart from `model_provider` and its own tables, the new file
@@ -234,9 +238,12 @@ veritas claude --model us.anthropic.claude-haiku-4-5-20251001-v1:0
   default, so "Fix this!" works on most machines. Keep those characters out of prompts given on the command line (point the tool at a file
   instead), or use `veritas codex --install-config` and run `codex` directly. If the character is
   in veritas's own settings (`AT&T` in the path of your Python, say), it says so and points you
-  to `--install-config`. Relative PATH entries are skipped as well, and app names are limited to
-  what Apigee allows (letters, digits, spaces, `.`, `-`, `_`). Untested on real Windows so far; the
-  tests run the Windows code paths on every OS.
+  to `--install-config` (or, for `veritas claude`, to `VERITAS_HOME`). PATH entries that aren't
+  absolute (`bin`, `C:bin`, `\bin`) are skipped as well. `veritas claude` refuses an app name
+  holding `"`, `%`, `$`, `` ` ``, `!`, `^`, `&`, `|`, `<`, `>` or `\` on Windows, because Claude Code
+  may run its token helper through cmd.exe or Git Bash, which would expand them; `veritas codex`
+  doesn't have that limit. Untested on real Windows so far; the tests run the Windows code paths
+  on every OS.
 - **The tests run on Windows, macOS and Linux in GitHub Actions** (`veritas-cli tests`).
 
 ## Stacks

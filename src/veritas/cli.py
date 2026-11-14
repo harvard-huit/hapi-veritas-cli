@@ -1,8 +1,8 @@
 """veritas command line."""
 
 import copy
+import hashlib
 import json
-import ntpath
 import os
 import re
 import shlex
@@ -394,6 +394,8 @@ def claude_settings_file(stack, client, windows=WINDOWS):
     Windows, mangles the quotes in an inline JSON string. One file per stack and client, so two
     sessions on different apps never rewrite each other's helper."""
     safe_client = re.sub(r"[^A-Za-z0-9._-]", "_", client)
+    if safe_client != client:   # keep "my app" and "my_app" apart
+        safe_client += "-" + hashlib.sha256(client.encode()).hexdigest()[:8]
     path = veritas_home() / "claude" / f"{stack.name}-{safe_client}.json"
     write_private_json(path, {"apiKeyHelper": helper_command(stack, client, windows)})
     return path
@@ -409,6 +411,10 @@ CMD_METACHARACTERS = frozenset('"%^&|<>\r\n')
 DELAYED_EXPANSION_KEY = r"Software\Microsoft\Command Processor"
 
 
+# A PATH entry veritas will search on Windows: `C:\...` or a UNC `\\server\share\...`.
+WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])")
+
+
 def find_program(name, windows=WINDOWS, environment=None):
     """The program's path on PATH only. On Windows, shutil.which searches the current directory
     first, so a `codex.cmd` committed to the repo you are in would run instead of the real one;
@@ -422,8 +428,8 @@ def find_program(name, windows=WINDOWS, environment=None):
     candidates += [name + extension for extension in extensions]
     for directory in environment.get("PATH", "").split(";"):
         directory = directory.strip().strip('"')
-        if not directory or not ntpath.isabs(directory):
-            continue
+        if not WINDOWS_ABSOLUTE_PATH.match(directory):
+            continue   # relative (`bin`), drive-relative (`C:bin`) or rooted (`\bin`): skip
         for candidate in candidates:
             program = os.path.join(directory, candidate)
             if os.path.isfile(program):
@@ -490,19 +496,16 @@ def launch(arguments, environment, windows=WINDOWS):
             continue   # Ctrl+C belongs to the tool, which shares the console; keep waiting
 
 
-# What an app name (or m2m consumerKey) may contain before it goes into a helper command line that
-# Claude Code may run through cmd.exe or Git Bash. Apigee app names are letters, digits, spaces
-# and . - _ ; nothing here is special to either shell inside double quotes.
-CLIENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
+# On Windows, Claude Code may run the apiKeyHelper command line through cmd.exe or Git Bash, where
+# these characters in the app name would be expanded even inside double quotes. Elsewhere the
+# helper is POSIX-quoted, and Codex's auth.args never meet a shell, so any app name is fine.
+HELPER_UNSAFE_CHARACTERS = frozenset('"%$`!^&|<>\\')
 
 
 def user_record(store, stack, client):
     """The client's token record, refreshed if needed, for a tool that acts as the user. An m2m
     token is refused before any refresh: it names no user, and an expired one would otherwise
     send the user to `veritas m2m`, only to be refused afterwards."""
-    if not CLIENT_NAME_PATTERN.match(client):
-        fail(f"app name {client!r} has characters an Apigee app name can't have (letters, digits, "
-             f"spaces and . - _ only)")
     stored = store.get(stack, client)
     if stored and stored.get("grant") == "client_credentials":
         fail(f"{client} holds an m2m token, which names no user: sign in with "
@@ -530,10 +533,25 @@ def claude(stack, app, claude_args):
     store = core.token_store()
     client = resolve_client(store, stack, app)
     user_record(store, stack, client)
+    if WINDOWS:
+        unsafe = sorted(HELPER_UNSAFE_CHARACTERS & set(client)) or \
+            [character for character in client if ord(character) < 0x20]
+        if unsafe:
+            fail(f"app name {client!r} holds {' '.join(map(repr, unsafe))}, which cmd.exe or Git Bash "
+                 f"would expand in Claude Code's token helper: veritas claude can't use this app on "
+                 f"Windows (veritas codex --install-config can)")
     claude_path = find_program("claude")
     if not claude_path:
         fail("claude (Claude Code) is not on PATH: install it first")
-    arguments = [claude_path, "--settings", str(claude_settings_file(stack, client)), *claude_args]
+    settings_path = str(claude_settings_file(stack, client))
+    own_problem = cmd_shim_problem([claude_path, "--settings", settings_path],
+                                   delayed_expansion_enabled()) if WINDOWS else None
+    if own_problem:
+        fail(f"veritas's own settings path {own_problem[0]!r} holds "
+             f"{describe_cmd_problem(own_problem[1])}, which cmd.exe (running "
+             f"{os.path.basename(claude_path)}) would misread: set VERITAS_HOME to a folder without "
+             f"those characters")
+    arguments = [claude_path, "--settings", settings_path, *claude_args]
     launch(arguments, claude_environment(stack, os.environ))
 
 
@@ -638,7 +656,7 @@ def codex_config_block(stack, client):
     """The provider for pasting into config.toml by hand (`--print-config`)."""
     provider_id = codex_provider_id(stack)
     return "\n".join([
-        f"# Paste these tables into ~/.codex/config.toml, replacing any earlier [model_providers.{provider_id}].",
+        f"# Paste these tables into {codex_config_path()}, replacing any earlier [model_providers.{provider_id}].",
         f"# Select the provider with a top-level  model_provider = \"{provider_id}\"  ABOVE the first",
         "# [table] in the file (below a table it would belong to that table).",
         "# Or let veritas do both: veritas codex --install-config",
@@ -655,12 +673,15 @@ def _managed_comment(provider_id):
             f"tables below")
 
 
+# The start and end markers the first 0.3.0 build wrote around its tables, for any stack. They are
+# only comments now; any left in the file would suggest veritas still manages what sits between them.
+LEGACY_MARKER = re.compile(r"\s*# (>>> veritas-[a-z0-9-]+: managed by `veritas codex --install-config`.*"
+                           r"|<<< veritas-[a-z0-9-]+ <<<)\s*$")
+
+
 def _is_marker(line, provider_id):
-    """This version's comment, or the start and end markers the first 0.3.0 build wrote."""
-    stripped = line.strip()
-    return (stripped.startswith(f"# >>> {provider_id}: managed by `veritas codex --install-config`")
-            or stripped == f"# <<< {provider_id} <<<"
-            or stripped == _managed_comment(provider_id))
+    """This version's comment for this provider, or a legacy marker of any veritas provider."""
+    return bool(LEGACY_MARKER.match(line)) or line.strip() == _managed_comment(provider_id)
 
 
 def _parse_toml(text, what):
@@ -677,9 +698,15 @@ def _without_provider(parsed, provider_id):
     providers = expected.get("model_providers")
     if isinstance(providers, dict):
         providers.pop(provider_id, None)
-        if not providers:
-            del expected["model_providers"]
-    return expected
+    return _comparable(expected)
+
+
+def _comparable(parsed):
+    """An empty model_providers table reads the same as none: removing our tables from under an
+    explicit [model_providers] header leaves one, and that isn't a change to anything the user had."""
+    if parsed.get("model_providers") == {}:
+        parsed = {key: value for key, value in parsed.items() if key != "model_providers"}
+    return parsed
 
 
 def install_codex_config(text, stack, client):
@@ -713,13 +740,25 @@ def install_codex_config(text, stack, client):
                 and not _is_marker(lines[span_end - 1], provider_id):
             span_end -= 1
         removed.update(range(index, span_end))
-    kept = [line for index, line in enumerate(lines) if index not in removed]
+    kept = []
+    after_removal = False
+    for index, line in enumerate(lines):
+        if index in removed:
+            after_removal = True
+            continue
+        blank = not line.strip()
+        if after_removal and blank and kept and not kept[-1].strip():
+            continue   # one blank line where a removed span was, not one from each side
+        if not blank:
+            after_removal = False
+        kept.append(line)
 
     expected = _without_provider(original, provider_id)
-    if _parse_toml("".join(kept), "removing the old veritas tables would break it") != expected:
-        raise CodexConfigError(f"[model_providers.{provider_id}] is laid out in a way veritas can't "
-                               f"replace without touching anything else (an inline table?): delete "
-                               f"it by hand, then run this again")
+    if _comparable(_parse_toml("".join(kept), "removing the old veritas tables would break it")) != expected:
+        raise CodexConfigError(f"veritas can't replace [model_providers.{provider_id}] here without "
+                               f"changing something else in the file (an inline, quoted or dotted "
+                               f"form, a sub-table of your own under it, or veritas marker text "
+                               f"inside a string?): remove it by hand, then run this again")
 
     first_table = next((index for index, line in enumerate(kept) if any_header.match(line)), len(kept))
     selection = f"model_provider = {toml_value(provider_id)}{newline}"
@@ -736,7 +775,7 @@ def install_codex_config(text, stack, client):
     expected["model_provider"] = provider_id
     expected.setdefault("model_providers", {})[provider_id] = \
         _parse_toml(tables, "the generated tables don't parse")["model_providers"][provider_id]
-    if _parse_toml(result, "editing it would not leave valid TOML") != expected:
+    if _comparable(_parse_toml(result, "editing it would not leave valid TOML")) != expected:
         raise CodexConfigError("its layout is unusual enough that the edit could not be verified "
                                "(is model_provider set somewhere other than the top of the file?)")
     return result, original.get("model_provider")
@@ -811,7 +850,8 @@ def config_cautions(stack):
         cautions.append(f"VERITAS_{scoped}_GATEWAY_BASE is now written into config.toml: every Codex "
                         f"session sends your token to {stack.gateway_base} until you install again "
                         f"without it.")
-    if os.environ.get("CODEX_HOME"):
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home and os.path.realpath(codex_home) != os.path.realpath(Path.home() / ".codex"):
         cautions.append("CODEX_HOME is set in this shell: a Codex started from the Dock reads "
                         "~/.codex/config.toml unless it is given CODEX_HOME too.")
     return cautions
@@ -862,13 +902,19 @@ def codex(stack, app, install_config, print_config, codex_args):
 
 def install_and_report(stack, client):
     path = codex_config_path()
+    provider_id = codex_provider_id(stack)
     try:
         original_raw, current = read_codex_config(path)
         text, previous = install_codex_config(current, stack, client)
+        if text == current:
+            click.echo(f"{provider_id} ({client}) is already installed and selected in {path}: "
+                       f"nothing to change.")
+            return
         backup = write_codex_config(path, text, original_raw)
     except CodexConfigError as problem:
         fail(f"left {path} unchanged: {problem}")
-    provider_id = codex_provider_id(stack)
+    except OSError as problem:
+        fail(f"could not update {path}: {problem}")
     click.echo(f"Installed {provider_id} ({client}) in {path} and selected it: plain `codex`, the "
                f"IDE extension and the desktop app now run on your {stack} user token (unless a "
                f"trusted project's own .codex/config.toml picks another provider).")
