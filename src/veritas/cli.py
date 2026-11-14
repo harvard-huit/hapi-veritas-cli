@@ -401,8 +401,12 @@ def claude_settings_file(stack, client, windows=WINDOWS):
 
 # cmd.exe re-reads the command line of a .cmd/.bat target (npm installs claude.cmd and codex.cmd),
 # ignoring Python's \" escaping and expanding %VAR%: these characters in an argument can corrupt the
-# command or run another one. `!` only matters with delayed expansion, which npm's shims don't use.
+# command or run another one.
 CMD_METACHARACTERS = frozenset('"%^&|<>\r\n')
+# With delayed expansion on, cmd.exe also replaces !VAR! with that variable's value (a prompt holding
+# !OPENAI_API_KEY! would send the key) and deletes a lone `!`. It is off unless the registry turns
+# it on, so `!` is refused only then: "Fix this!" stays usable everywhere else.
+DELAYED_EXPANSION_KEY = r"Software\Microsoft\Command Processor"
 
 
 def find_program(name, windows=WINDOWS, environment=None):
@@ -427,16 +431,44 @@ def find_program(name, windows=WINDOWS, environment=None):
     return None
 
 
-def cmd_shim_problem(arguments):
+def delayed_expansion_enabled(windows=WINDOWS):
+    """Whether cmd.exe runs with delayed expansion by default: the DelayedExpansion DWORD under
+    HKCU, or HKLM when HKCU has none (`cmd /?`: the per-user setting takes precedence)."""
+    if not windows:
+        return False
+    try:
+        import winreg
+    except ImportError:   # only when Windows is simulated elsewhere (tests); real Windows has it
+        return False
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, DELAYED_EXPANSION_KEY) as key:
+                value, _ = winreg.QueryValueEx(key, "DelayedExpansion")
+        except OSError:
+            continue   # no key or no value in this hive: ask the next one
+        return value == 1
+    return False
+
+
+def cmd_shim_problem(arguments, delayed_expansion=False):
     """The first argument cmd.exe would misread, with the offending characters, when the target is
     a .cmd/.bat shim; None when the launch is safe."""
     if os.path.splitext(arguments[0])[1].lower() not in (".cmd", ".bat"):
         return None
+    unsafe = CMD_METACHARACTERS | {"!"} if delayed_expansion else CMD_METACHARACTERS
     for argument in arguments:
-        found = sorted(CMD_METACHARACTERS & set(argument))
+        found = sorted(unsafe & set(argument))
         if found:
             return argument, found
     return None
+
+
+def describe_cmd_problem(characters):
+    named = " ".join(repr(character) for character in characters)
+    if "!" in characters:
+        named += (" (delayed expansion is on for cmd.exe in this Windows account: DelayedExpansion=1 "
+                  "under HKCU or HKLM\\" + DELAYED_EXPANSION_KEY + ")")
+    return named
 
 
 def launch(arguments, environment, windows=WINDOWS):
@@ -444,12 +476,12 @@ def launch(arguments, environment, windows=WINDOWS):
     exit with its code."""
     if not windows:
         os.execve(arguments[0], arguments, environment)
-    problem = cmd_shim_problem(arguments)
+    problem = cmd_shim_problem(arguments, delayed_expansion_enabled(windows))
     if problem:
         argument, characters = problem
         fail(f"{os.path.basename(arguments[0])} is a cmd.exe script, which would misread "
-             f"{' '.join(repr(character) for character in characters)} in {argument!r}. Leave those "
-             f"characters out (put a long prompt in a file and point the tool at it)")
+             f"{describe_cmd_problem(characters)} in {argument!r}. Leave those characters out (put "
+             f"a long prompt in a file and point the tool at it)")
     process = subprocess.Popen(arguments, env=environment)
     while True:
         try:
@@ -820,9 +852,9 @@ def codex(stack, app, install_config, print_config, codex_args):
     if not codex_path:
         fail("codex (OpenAI Codex CLI) is not on PATH: install it first, or use "
              f"`veritas codex -e {stack} --install-config` to configure the IDE extension")
-    own_problem = cmd_shim_problem([codex_path, *overrides]) if WINDOWS else None
+    own_problem = cmd_shim_problem([codex_path, *overrides], delayed_expansion_enabled()) if WINDOWS else None
     if own_problem:
-        fail(f"veritas's own setting {own_problem[0]!r} holds {' '.join(map(repr, own_problem[1]))}, "
+        fail(f"veritas's own setting {own_problem[0]!r} holds {describe_cmd_problem(own_problem[1])}, "
              f"which cmd.exe (running {os.path.basename(codex_path)}) would misread. Run "
              f"`veritas codex -e {stack} --install-config` once, then start `codex` directly")
     launch([codex_path, *overrides, *codex_args], dict(os.environ))

@@ -228,7 +228,10 @@ veritas claude --model us.anthropic.claude-haiku-4-5-20251001-v1:0
   Windows otherwise does), so a `codex.cmd` committed to a repo can't stand in for the real one.
 - **npm installs them as `.cmd` scripts, which cmd.exe re-reads.** veritas refuses to pass an
   argument containing `"`, `%`, `^`, `&`, `|`, `<` or `>` to one, because cmd.exe would misread
-  it. Keep those characters out of prompts given on the command line (point the tool at a file
+  it. If cmd.exe's delayed expansion is turned on (`DelayedExpansion=1` under
+  `HKCU` or `HKLM\Software\Microsoft\Command Processor`), `!` is refused too: cmd.exe would
+  replace `!NAME!` with that environment variable's value and drop a lone `!`. It is off by
+  default, so "Fix this!" works on most machines. Keep those characters out of prompts given on the command line (point the tool at a file
   instead), or use `veritas codex --install-config` and run `codex` directly. If the character is
   in veritas's own settings (`AT&T` in the path of your Python, say), it says so and points you
   to `--install-config`. Relative PATH entries are skipped as well, and app names are limited to

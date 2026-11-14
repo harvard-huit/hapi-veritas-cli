@@ -2,6 +2,7 @@ import pathlib
 import json
 import shlex
 import subprocess
+import sys
 import time
 
 import httpx
@@ -402,6 +403,71 @@ def test_windows_launch_refuses_what_cmd_exe_would_misread(monkeypatch, argument
     with pytest.raises(SystemExit) as exited:
         cli.launch([r"C:\npm\codex.cmd", "exec", argument], {}, windows=True)
     assert exited.value.code == 1
+
+
+class FakeRegistry:
+    """Stands in for winreg: {hive: {value name: value}} for the Command Processor key."""
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE = "HKCU", "HKLM"
+
+    def __init__(self, hives):
+        self.hives = hives
+
+    def OpenKey(self, hive, key):
+        assert key == cli.DELAYED_EXPANSION_KEY
+        if hive not in self.hives:
+            raise FileNotFoundError(key)
+        values = self.hives[hive]
+
+        class Key:
+            def __enter__(self):
+                return values
+
+            def __exit__(self, *exception):
+                return False
+        return Key()
+
+    def QueryValueEx(self, values, name):
+        if name not in values:
+            raise FileNotFoundError(name)
+        return values[name], 4
+
+
+@pytest.mark.parametrize("hives, enabled", [
+    ({}, False),
+    ({"HKLM": {}}, False),
+    ({"HKLM": {"DelayedExpansion": 1}}, True),
+    ({"HKCU": {"DelayedExpansion": 0}, "HKLM": {"DelayedExpansion": 1}}, False),   # user wins
+    ({"HKCU": {"DelayedExpansion": 1}, "HKLM": {"DelayedExpansion": 0}}, True),
+    ({"HKCU": {}, "HKLM": {"DelayedExpansion": 1}}, True),   # no user value: machine decides
+])
+def test_delayed_expansion_follows_the_registry_with_the_user_setting_first(monkeypatch, hives, enabled):
+    monkeypatch.setitem(sys.modules, "winreg", FakeRegistry(hives))
+    assert cli.delayed_expansion_enabled(windows=True) is enabled
+    assert cli.delayed_expansion_enabled(windows=False) is False
+
+
+def test_exclamation_marks_pass_unless_delayed_expansion_is_on(monkeypatch):
+    started = []
+
+    class Finished:
+        def wait(self):
+            return 0
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda arguments, env: started.append(arguments) or Finished())
+    monkeypatch.setitem(sys.modules, "winreg", FakeRegistry({}))
+    with pytest.raises(SystemExit):
+        cli.launch([r"C:\npm\codex.cmd", "exec", "Fix this!"], {}, windows=True)
+    assert started and started[0][-1] == "Fix this!"
+
+    started.clear()
+    monkeypatch.setitem(sys.modules, "winreg", FakeRegistry({"HKCU": {"DelayedExpansion": 1}}))
+    with pytest.raises(SystemExit) as exited:
+        cli.launch([r"C:\npm\codex.cmd", "exec", "show !OPENAI_API_KEY!"], {}, windows=True)
+    assert exited.value.code == 1 and not started
+
+
+def test_delayed_expansion_message_names_the_setting(capsys):
+    assert "DelayedExpansion=1" in cli.describe_cmd_problem(["!"])
+    assert "DelayedExpansion" not in cli.describe_cmd_problem(["&"])
 
 
 def test_windows_launch_of_an_exe_passes_any_argument(monkeypatch):
