@@ -36,6 +36,11 @@ CODEX_TOKEN_REFRESH_MS = 300_000
 # the child's environment so a key exported in a profile can't silently win.
 COMPETING_CLAUDE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
                                 "AWS_BEARER_TOKEN_BEDROCK")
+# How this same CLI is re-run as a token helper (Claude Code's apiKeyHelper, Codex's auth.command).
+# `-P` keeps the working directory off sys.path: both tools run the helper from the user's project,
+# and with plain `-m` a `veritas/` or `click.py` there would run instead of veritas, with keychain
+# access and its output sent as the bearer token. `-P` needs Python 3.11, which pyproject requires.
+TOKEN_HELPER_ARGUMENTS = ("-P", "-m", "veritas.cli", "token")
 # Windows has no exec: os.execve there starts a SEPARATE process and returns, leaving veritas and
 # Claude Code fighting over one console, and it cannot run npm's claude.cmd at all.
 WINDOWS = os.name == "nt"
@@ -369,7 +374,7 @@ def helper_command(stack, client, windows=WINDOWS):
     `veritas` on PATH and in whatever virtualenv this one runs from. On Windows, Claude Code may run
     the helper through cmd.exe or Git Bash; double-quoted arguments and a forward-slash path read
     the same in both (bash would eat unquoted backslashes, cmd ignores single quotes)."""
-    arguments = [sys.executable, "-m", "veritas.cli", "token", "-e", stack.name, "--app", client]
+    arguments = [sys.executable, *TOKEN_HELPER_ARGUMENTS, "-e", stack.name, "--app", client]
     if not windows:
         return shlex.join(arguments)
     arguments[0] = arguments[0].replace("\\", "/")
@@ -437,7 +442,7 @@ def codex_provider_name(stack, client):
 def codex_token_command(stack, client):
     """`veritas token` by interpreter path, as Codex's provider auth command. Codex runs it with no
     shell (command + argument array), so no quoting is needed on any platform."""
-    return sys.executable, ["-m", "veritas.cli", "token", "-e", stack.name, "--app", client]
+    return sys.executable, [*TOKEN_HELPER_ARGUMENTS, "-e", stack.name, "--app", client]
 
 
 def codex_provider_settings(stack, client):

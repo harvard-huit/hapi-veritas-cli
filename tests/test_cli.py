@@ -1,5 +1,7 @@
 import pathlib
 import json
+import shlex
+import subprocess
 import time
 
 import httpx
@@ -194,7 +196,7 @@ def test_claude_runs_claude_code_on_the_gateway_with_a_refreshing_token(monkeypa
     assert passed_through == ["-p", "hello", "--model", "m"]
     # Settings travel as a FILE (cmd.exe mangles an inline JSON argument on Windows).
     helper = json.loads(pathlib.Path(settings_path).read_text())["apiKeyHelper"]
-    assert "-m veritas.cli token -e dev --app awa-cli" in helper.replace('"', "").replace("'", "")
+    assert "-P -m veritas.cli token -e dev --app awa-cli" in helper.replace('"', "").replace("'", "")
 
     environment = launched["environment"]
     assert environment["CLAUDE_CODE_USE_BEDROCK"] == "1"
@@ -255,7 +257,7 @@ def test_codex_runs_codex_on_the_gateway_with_a_refreshing_token(monkeypatch, to
     assert json.loads(settings[f"{provider}.base_url"]) == \
         "https://dev.apis.huit.harvard.edu/ais-openai-direct/v2"
     assert json.loads(settings[f"{provider}.auth.args"]) == \
-        ["-m", "veritas.cli", "token", "-e", "dev", "--app", "awa-cli"]
+        ["-P", "-m", "veritas.cli", "token", "-e", "dev", "--app", "awa-cli"]
     assert int(settings[f"{provider}.auth.refresh_interval_ms"]) < 3600 * 1000
     # No model is chosen for the user, and no token or key is on the command line.
     assert not any(key == "model" for key in settings)
@@ -300,10 +302,43 @@ def test_codex_not_installed_points_at_print_config(monkeypatch, token_endpoint)
     assert "--print-config" in result.output
 
 
+@pytest.fixture
+def project_shadowing_veritas(tmp_path):
+    """A project directory holding its own `veritas` package, as a cloned repo (or a coding agent
+    writing to the workspace) could. Imported from here, it prints a fake token and exits 0."""
+    package = tmp_path / "veritas"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "cli.py").write_text("print('SHADOWED-TOKEN')\n")
+    return tmp_path
+
+
+def run_from(directory, command):
+    """Run a token-helper command as Claude Code or Codex would, from the user's project, with
+    `--version` in place of `token ...` so nothing needs a login."""
+    module_end = command.index("veritas.cli") + 1
+    return subprocess.run([*command[:module_end], "--version"], cwd=directory,
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_codex_auth_command_ignores_a_veritas_package_in_the_project(project_shadowing_veritas):
+    executable, arguments = cli.codex_token_command(resolve("dev"), "awa-cli")
+    result = run_from(project_shadowing_veritas, [executable, *arguments])
+    assert "SHADOWED" not in result.stdout
+    assert result.returncode == 0 and "veritas, version" in result.stdout
+
+
+def test_claude_helper_ignores_a_veritas_package_in_the_project(project_shadowing_veritas):
+    command = shlex.split(cli.helper_command(resolve("dev"), "awa-cli", windows=False))
+    result = run_from(project_shadowing_veritas, command)
+    assert "SHADOWED" not in result.stdout
+    assert result.returncode == 0 and "veritas, version" in result.stdout
+
+
 def test_helper_command_on_windows_reads_the_same_in_cmd_and_git_bash(monkeypatch):
     monkeypatch.setattr(cli.sys, "executable", r"C:\Users\Mark Stacy\proj\.venv\Scripts\python.exe")
     command = cli.helper_command(resolve("dev"), "awa-veritas_cli", windows=True)
-    assert command == ('"C:/Users/Mark Stacy/proj/.venv/Scripts/python.exe" "-m" "veritas.cli" '
+    assert command == ('"C:/Users/Mark Stacy/proj/.venv/Scripts/python.exe" "-P" "-m" "veritas.cli" '
                        '"token" "-e" "dev" "--app" "awa-veritas_cli"')
     assert "\\" not in command and "'" not in command
 
@@ -311,7 +346,7 @@ def test_helper_command_on_windows_reads_the_same_in_cmd_and_git_bash(monkeypatc
 def test_helper_command_elsewhere_is_posix_quoted(monkeypatch):
     monkeypatch.setattr(cli.sys, "executable", "/home/me/my venv/bin/python")
     command = cli.helper_command(resolve("dev"), "awa-veritas_cli", windows=False)
-    assert command == "'/home/me/my venv/bin/python' -m veritas.cli token -e dev --app awa-veritas_cli"
+    assert command == "'/home/me/my venv/bin/python' -P -m veritas.cli token -e dev --app awa-veritas_cli"
 
 
 def test_settings_file_is_per_stack_and_client(isolated_home):
