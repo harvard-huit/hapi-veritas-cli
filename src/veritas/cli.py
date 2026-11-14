@@ -27,6 +27,11 @@ QUOTA_HEADER_MARKERS = ("quota", "ratelimit", "x-ais", "remaining")
 # `veritas claude`: Claude Code in Bedrock mode, pointed at the gateway's pass-through Bedrock proxy.
 BEDROCK_PROXY_PATH = "/ais-bedrock-llm/v2"
 DEFAULT_BEDROCK_REGION = "us-east-1"
+# `veritas codex`: Codex on the gateway's OpenAI proxy (it appends /responses and /models).
+OPENAI_PROXY_PATH = "/ais-openai-direct/v2"
+# How often Codex re-runs `veritas token` on its own. It also re-runs it on a 401, so this only
+# has to beat the one-hour access token, not match it.
+CODEX_TOKEN_REFRESH_MS = 300_000
 # Credentials Claude Code would prefer over the gateway token, or send in its place. Removed from
 # the child's environment so a key exported in a profile can't silently win.
 COMPETING_CLAUDE_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
@@ -386,7 +391,8 @@ def claude_settings_file(stack, client, windows=WINDOWS):
 
 
 def launch(arguments, environment, windows=WINDOWS):
-    """Replace this process with Claude Code; on Windows, run it as a child and exit with its code."""
+    """Replace this process with the tool (Claude Code, Codex); on Windows, run it as a child and
+    exit with its code."""
     if not windows:
         os.execve(arguments[0], arguments, environment)
     process = subprocess.Popen(arguments, env=environment)
@@ -418,6 +424,104 @@ def claude(stack, app, claude_args):
         fail("claude (Claude Code) is not on PATH: install it first")
     arguments = [claude_path, "--settings", str(claude_settings_file(stack, client)), *claude_args]
     launch(arguments, claude_environment(stack, os.environ))
+
+
+def codex_provider_id(stack):
+    return f"veritas-{stack.name}"
+
+
+def codex_provider_name(stack, client):
+    return f"Veritas {stack.name} {client}"
+
+
+def codex_token_command(stack, client):
+    """`veritas token` by interpreter path, as Codex's provider auth command. Codex runs it with no
+    shell (command + argument array), so no quoting is needed on any platform."""
+    return sys.executable, ["-m", "veritas.cli", "token", "-e", stack.name, "--app", client]
+
+
+def codex_provider_settings(stack, client):
+    """Codex settings, as (dotted key, value) pairs, for a provider that sends the user token.
+
+    `auth.command` is Codex's counterpart of Claude Code's apiKeyHelper: its output goes as
+    `Authorization: Bearer`, re-fetched every refresh_interval_ms and on a 401. Nothing secret is
+    in here, only the command that fetches the token from the veritas store."""
+    provider = f"model_providers.{codex_provider_id(stack)}"
+    command, arguments = codex_token_command(stack, client)
+    return [
+        # No parentheses or other cmd.exe metacharacters: on Windows these flags pass through
+        # npm's codex.cmd.
+        (f"{provider}.name", codex_provider_name(stack, client)),
+        (f"{provider}.base_url", f"{stack.gateway_base}{OPENAI_PROXY_PATH}"),
+        (f"{provider}.wire_api", "responses"),
+        (f"{provider}.auth.command", command),
+        (f"{provider}.auth.args", arguments),
+        (f"{provider}.auth.refresh_interval_ms", CODEX_TOKEN_REFRESH_MS),
+    ]
+
+
+def toml_value(value):
+    """A TOML literal for a string, integer or list of strings. JSON's string escapes are valid
+    TOML basic-string escapes, and a JSON array of strings is a valid TOML array."""
+    return str(value) if isinstance(value, int) else json.dumps(value)
+
+
+def codex_overrides(stack, client):
+    """`-c key=value` flags selecting the veritas provider for this one run, leaving
+    ~/.codex/config.toml untouched."""
+    settings = [("model_provider", codex_provider_id(stack)), *codex_provider_settings(stack, client)]
+    flags = []
+    for key, value in settings:
+        flags += ["-c", f"{key}={toml_value(value)}"]
+    return flags
+
+
+def codex_config_block(stack, client):
+    """The same provider as a config.toml block, for Codex launched without veritas (the IDE
+    extension, the desktop app)."""
+    provider_id = codex_provider_id(stack)
+    command, arguments = codex_token_command(stack, client)
+    return "\n".join([
+        f"# Select it with:  model_provider = \"{provider_id}\"   (top level, or in a profile)",
+        f"[model_providers.{provider_id}]",
+        f"name = {toml_value(codex_provider_name(stack, client))}",
+        f"base_url = {toml_value(f'{stack.gateway_base}{OPENAI_PROXY_PATH}')}",
+        'wire_api = "responses"',
+        "",
+        f"[model_providers.{provider_id}.auth]",
+        f"command = {toml_value(command)}",
+        f"args = {toml_value(arguments)}",
+        f"refresh_interval_ms = {CODEX_TOKEN_REFRESH_MS}",
+    ])
+
+
+@main.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@with_stack
+@with_app
+@click.option("--print-config", is_flag=True,
+              help="Print the provider as a ~/.codex/config.toml block instead of running Codex, "
+                   "for the IDE extension or desktop app.")
+@click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
+def codex(stack, app, print_config, codex_args):
+    """Run OpenAI Codex through the stack's OpenAI proxy as you, on your user token.
+
+    Every call is charged to your per-user AI Services limit inside the app's. Arguments after the
+    veritas options go to codex unchanged, e.g. `veritas codex -e dev exec "hello"` or
+    `veritas codex -e dev -m <model>`."""
+    store = core.token_store()
+    client = resolve_client(store, stack, app)
+    record = fresh_record(store, stack, client)   # fail here, before launching, if not signed in
+    if record.get("grant") == "client_credentials":
+        fail(f"{client} holds an m2m token, which names no user: sign in with "
+             f"`veritas login -e {stack} --app <APP NAME>`")
+    if print_config:
+        click.echo(codex_config_block(stack, client))
+        return
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        fail("codex (OpenAI Codex CLI) is not on PATH: install it first, or use "
+             f"`veritas codex -e {stack} --print-config` to configure the IDE extension")
+    launch([codex_path, *codex_overrides(stack, client), *codex_args], dict(os.environ))
 
 
 def run():

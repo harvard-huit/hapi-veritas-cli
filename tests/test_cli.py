@@ -220,6 +220,86 @@ def test_claude_without_a_login_says_how_to_sign_in(monkeypatch):
     assert "veritas login" in result.output
 
 
+def codex_flags(arguments):
+    """{key: raw TOML value} from a list of `-c key=value` flags, and the arguments left over."""
+    settings, rest, index = {}, [], 0
+    while index < len(arguments):
+        if arguments[index] == "-c":
+            key, _, value = arguments[index + 1].partition("=")
+            settings[key] = value
+            index += 2
+        else:
+            rest.append(arguments[index])
+            index += 1
+    return settings, rest
+
+
+def test_codex_runs_codex_on_the_gateway_with_a_refreshing_token(monkeypatch, token_endpoint):
+    store = TokenStore()
+    store.put("dev", "awa-cli", stored())
+    store.set_active_client("dev", "awa-cli")
+    launched = {}
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/codex")
+    monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.update(
+        arguments=arguments, environment=environment))
+
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "exec", "hello", "-m", "m"])
+    assert result.exit_code == 0, result.output
+
+    codex_path, *arguments = launched["arguments"]
+    assert codex_path == "/usr/local/bin/codex"
+    settings, passed_through = codex_flags(arguments)
+    assert passed_through == ["exec", "hello", "-m", "m"]
+    provider = "model_providers.veritas-dev"
+    assert json.loads(settings["model_provider"]) == "veritas-dev"
+    assert json.loads(settings[f"{provider}.base_url"]) == \
+        "https://dev.apis.huit.harvard.edu/ais-openai-direct/v2"
+    assert json.loads(settings[f"{provider}.auth.args"]) == \
+        ["-m", "veritas.cli", "token", "-e", "dev", "--app", "awa-cli"]
+    assert int(settings[f"{provider}.auth.refresh_interval_ms"]) < 3600 * 1000
+    # No model is chosen for the user, and no token or key is on the command line.
+    assert not any(key == "model" for key in settings)
+    assert "old-access" not in " ".join(launched["arguments"])
+
+
+def test_codex_print_config_is_valid_toml_and_launches_nothing(monkeypatch, token_endpoint):
+    tomllib = pytest.importorskip("tomllib")
+    store = TokenStore()
+    store.put("dev", "awa-cli", stored())
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--app", "awa-cli", "--print-config"])
+    assert result.exit_code == 0, result.output
+    provider = tomllib.loads(result.output)["model_providers"]["veritas-dev"]
+    assert provider["base_url"] == "https://dev.apis.huit.harvard.edu/ais-openai-direct/v2"
+    assert provider["auth"]["args"][-2:] == ["--app", "awa-cli"]
+    assert "old-access" not in result.output
+
+
+def test_codex_overrides_parse_as_toml_on_any_path():
+    tomllib = pytest.importorskip("tomllib")
+    settings, _ = codex_flags(cli.codex_overrides(resolve("dev"), 'awa-"odd" app'))
+    for key, value in settings.items():
+        tomllib.loads(f"probe = {value}")   # each value must be a TOML literal on its own
+
+
+def test_codex_refuses_an_m2m_token(monkeypatch, token_endpoint):
+    store = TokenStore()
+    store.put("dev", "consumer-key", stored(grant="client_credentials", refresh_in=None))
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--app", "consumer-key"])
+    assert result.exit_code == 1
+    assert "names no user" in result.output
+
+
+def test_codex_not_installed_points_at_print_config(monkeypatch, token_endpoint):
+    store = TokenStore()
+    store.put("dev", "awa-cli", stored())
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--app", "awa-cli"])
+    assert result.exit_code == 1
+    assert "--print-config" in result.output
+
+
 def test_helper_command_on_windows_reads_the_same_in_cmd_and_git_bash(monkeypatch):
     monkeypatch.setattr(cli.sys, "executable", r"C:\Users\Mark Stacy\proj\.venv\Scripts\python.exe")
     command = cli.helper_command(resolve("dev"), "awa-veritas_cli", windows=True)

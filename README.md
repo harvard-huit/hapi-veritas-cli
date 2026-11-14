@@ -132,6 +132,38 @@ lot of context with each request: a one-line Haiku prompt cost about $0.05. A pe
 for curl tests (cents per hour) will stop a session on its first request with a 429. Set
 `CLAUDE_CODE_MAX_RETRIES=1` to make that fail fast instead of retrying.
 
+### Codex as you
+
+```bash
+veritas login -e dev --app awa-veritas_cli     # once; the app needs OpenAI granted in AI access
+veritas codex -e dev                           # interactive Codex
+veritas codex -e dev exec "explain this repo"  # anything after the veritas options goes to codex
+veritas codex -e dev -m <model>
+```
+
+`veritas codex` runs the Codex CLI against `<gateway>/ais-openai-direct/v2` with a provider named
+`veritas-<stack>`, passed as `-c` overrides for that one run. Your `~/.codex/config.toml` is not
+changed. The provider has no key. Its `auth.command` is `veritas token`, so Codex gets your user
+token from the veritas store. Codex re-runs the command every 5 minutes and after any 401, so a
+session outlasts the one-hour token. That command takes priority over an `OPENAI_API_KEY` or
+`CODEX_API_KEY` in your environment.
+
+**The IDE extension and the desktop app** start Codex themselves, so veritas can't pass it flags.
+Add the provider to `~/.codex/config.toml` once:
+
+```bash
+veritas codex -e dev --app awa-veritas_cli --print-config >> ~/.codex/config.toml
+```
+
+Then select it with `model_provider = "veritas-dev"` at the top level, or in a profile. The block
+contains the path of the Python veritas runs from, so print it again if you reinstall veritas. It
+contains no token or secret.
+
+veritas sets no model here either. Codex uses the `model` from your config or `-m`, and the proxy
+has to allow it. Every request is charged to your **per-user** OpenAI limit, inside the app's.
+Codex retries a failed request up to 5 times by default, so a per-user limit sized for curl tests
+will be hit fast.
+
 ## Windows
 
 Everything works on Windows. The examples above are bash; in PowerShell:
