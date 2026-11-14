@@ -7,8 +7,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import click
@@ -395,40 +397,103 @@ def claude_settings_file(stack, client, windows=WINDOWS):
     return path
 
 
+# cmd.exe re-reads the command line of a .cmd/.bat target (npm installs claude.cmd and codex.cmd),
+# ignoring Python's \" escaping and expanding %VAR%: these characters in an argument can corrupt the
+# command or run another one. `!` only matters with delayed expansion, which npm's shims don't use.
+CMD_METACHARACTERS = frozenset('"%^&|<>\r\n')
+
+
+def find_program(name, windows=WINDOWS, environment=None):
+    """The program's path on PATH only. On Windows, shutil.which searches the current directory
+    first, so a `codex.cmd` committed to the repo you are in would run instead of the real one."""
+    environment = os.environ if environment is None else environment
+    if not windows:
+        return shutil.which(name, path=environment.get("PATH"))
+    extensions = [extension for extension in environment.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+                  if extension]
+    candidates = [name] if os.path.splitext(name)[1] else []
+    candidates += [name + extension for extension in extensions]
+    for directory in environment.get("PATH", "").split(";"):
+        directory = directory.strip().strip('"')
+        if directory in ("", "."):
+            continue
+        for candidate in candidates:
+            program = os.path.join(directory, candidate)
+            if os.path.isfile(program):
+                return program
+    return None
+
+
+def cmd_shim_problem(arguments):
+    """The first argument cmd.exe would misread, with the offending characters, when the target is
+    a .cmd/.bat shim; None when the launch is safe."""
+    if os.path.splitext(arguments[0])[1].lower() not in (".cmd", ".bat"):
+        return None
+    for argument in arguments:
+        found = sorted(CMD_METACHARACTERS & set(argument))
+        if found:
+            return argument, found
+    return None
+
+
 def launch(arguments, environment, windows=WINDOWS):
     """Replace this process with the tool (Claude Code, Codex); on Windows, run it as a child and
     exit with its code."""
     if not windows:
         os.execve(arguments[0], arguments, environment)
+    problem = cmd_shim_problem(arguments)
+    if problem:
+        argument, characters = problem
+        fail(f"{os.path.basename(arguments[0])} is a cmd.exe script, which would misread "
+             f"{' '.join(repr(character) for character in characters)} in {argument!r}. Leave those "
+             f"characters out (put a long prompt in a file and point the tool at it)")
     process = subprocess.Popen(arguments, env=environment)
     while True:
         try:
             sys.exit(process.wait())
         except KeyboardInterrupt:
-            continue   # Ctrl+C belongs to Claude Code, which shares the console; keep waiting
+            continue   # Ctrl+C belongs to the tool, which shares the console; keep waiting
 
 
-@main.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+def user_record(store, stack, client):
+    """The client's token record, refreshed if needed, for a tool that acts as the user. An m2m
+    token is refused before any refresh: it names no user, and an expired one would otherwise
+    send the user to `veritas m2m`, only to be refused afterwards."""
+    stored = store.get(stack, client)
+    if stored and stored.get("grant") == "client_credentials":
+        fail(f"{client} holds an m2m token, which names no user: sign in with "
+             f"`veritas login -e {stack} --app <APP NAME>`")
+    return fresh_record(store, stack, client)   # fail here, before launching, if not signed in
+
+
+# Veritas options come first; parsing stops at the tool's first argument, so everything from there
+# on (its own -e, --help, `--`) reaches the tool unchanged.
+PASSTHROUGH_COMMAND = {"ignore_unknown_options": True, "allow_extra_args": True,
+                       "allow_interspersed_args": False}
+
+
+@main.command(context_settings=PASSTHROUGH_COMMAND)
 @with_stack
 @with_app
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(stack, app, claude_args):
     """Run Claude Code through the stack's Bedrock proxy as you, on your user token.
 
-    Every call is charged to your per-user AI Services limit inside the app's. Arguments after the
-    veritas options go to claude unchanged, e.g. `veritas claude -e dev -p "hello"` or
-    `veritas claude -e dev --model us.anthropic.claude-sonnet-5-5`."""
+    Every call is charged to your per-user AI Services limit inside the app's. Put the veritas
+    options first: everything from claude's first argument on goes to claude unchanged, e.g.
+    `veritas claude -e dev -p "hello"` or `veritas claude -e dev --model us.anthropic.claude-sonnet-5-5`."""
     store = core.token_store()
     client = resolve_client(store, stack, app)
-    record = fresh_record(store, stack, client)   # fail here, before launching, if not signed in
-    if record.get("grant") == "client_credentials":
-        fail(f"{client} holds an m2m token, which names no user: sign in with "
-             f"`veritas login -e {stack} --app <APP NAME>`")
-    claude_path = shutil.which("claude")
+    user_record(store, stack, client)
+    claude_path = find_program("claude")
     if not claude_path:
         fail("claude (Claude Code) is not on PATH: install it first")
     arguments = [claude_path, "--settings", str(claude_settings_file(stack, client)), *claude_args]
     launch(arguments, claude_environment(stack, os.environ))
+
+
+class CodexConfigError(Exception):
+    pass
 
 
 def codex_provider_id(stack):
@@ -446,87 +511,216 @@ def codex_token_command(stack, client):
 
 
 def codex_provider_settings(stack, client):
-    """Codex settings, as (dotted key, value) pairs, for a provider that sends the user token.
+    """Codex settings, as (key under the provider, value) pairs, for a provider that sends the
+    user token.
 
     `auth.command` is Codex's counterpart of Claude Code's apiKeyHelper: its output goes as
     `Authorization: Bearer`, re-fetched every refresh_interval_ms and on a 401. Nothing secret is
     in here, only the command that fetches the token from the veritas store."""
-    provider = f"model_providers.{codex_provider_id(stack)}"
     command, arguments = codex_token_command(stack, client)
     return [
-        # No parentheses or other cmd.exe metacharacters: on Windows these flags pass through
-        # npm's codex.cmd.
-        (f"{provider}.name", codex_provider_name(stack, client)),
-        (f"{provider}.base_url", f"{stack.gateway_base}{OPENAI_PROXY_PATH}"),
-        (f"{provider}.wire_api", "responses"),
-        (f"{provider}.auth.command", command),
-        (f"{provider}.auth.args", arguments),
-        (f"{provider}.auth.refresh_interval_ms", CODEX_TOKEN_REFRESH_MS),
+        ("name", codex_provider_name(stack, client)),
+        ("base_url", f"{stack.gateway_base}{OPENAI_PROXY_PATH}"),
+        ("wire_api", "responses"),
+        ("auth.command", command),
+        ("auth.args", arguments),
+        ("auth.refresh_interval_ms", CODEX_TOKEN_REFRESH_MS),
     ]
 
 
 def toml_value(value):
-    """A TOML literal for a string, integer or list of strings. JSON's string escapes are valid
-    TOML basic-string escapes, and a JSON array of strings is a valid TOML array."""
-    return str(value) if isinstance(value, int) else json.dumps(value)
+    """A TOML literal for a bool, integer, string or list of them.
+
+    Strings are TOML literal strings ('...') whenever they can be: no escapes, so any Unicode
+    text survives, and no double quotes reach the command line (cmd.exe misreads those). A string
+    holding ' or a control character falls back to a basic string with JSON escapes."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    text = str(value)
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in text):
+        raise CodexConfigError(f"{text!r} is not valid Unicode (undecodable bytes in a path?), so "
+                               f"it cannot go in a Codex config")
+    if "'" not in text and not any(ord(character) < 0x20 and character != "\t" or ord(character) == 0x7F
+                                   for character in text):
+        return f"'{text}'"
+    return json.dumps(text, ensure_ascii=False)
 
 
 def codex_overrides(stack, client):
     """`-c key=value` flags selecting the veritas provider for this one run, leaving
     ~/.codex/config.toml untouched."""
-    settings = [("model_provider", codex_provider_id(stack)), *codex_provider_settings(stack, client)]
+    provider = f"model_providers.{codex_provider_id(stack)}"
+    settings = [("model_provider", codex_provider_id(stack)),
+                *((f"{provider}.{key}", value) for key, value in codex_provider_settings(stack, client))]
     flags = []
     for key, value in settings:
         flags += ["-c", f"{key}={toml_value(value)}"]
     return flags
 
 
-def codex_config_block(stack, client):
-    """The same provider as a config.toml block, for Codex launched without veritas (the IDE
-    extension, the desktop app)."""
+def codex_provider_tables(stack, client):
+    """The provider as config.toml tables (no top-level keys)."""
     provider_id = codex_provider_id(stack)
-    command, arguments = codex_token_command(stack, client)
+    plain = [(key, value) for key, value in codex_provider_settings(stack, client)
+             if not key.startswith("auth.")]
+    auth = [(key[len("auth."):], value) for key, value in codex_provider_settings(stack, client)
+            if key.startswith("auth.")]
+    lines = [f"[model_providers.{provider_id}]"]
+    lines += [f"{key} = {toml_value(value)}" for key, value in plain]
+    lines += ["", f"[model_providers.{provider_id}.auth]"]
+    lines += [f"{key} = {toml_value(value)}" for key, value in auth]
+    return "\n".join(lines)
+
+
+def codex_config_block(stack, client):
+    """The provider for pasting into config.toml by hand (`--print-config`)."""
+    provider_id = codex_provider_id(stack)
     return "\n".join([
-        f"# Select it with:  model_provider = \"{provider_id}\"   (top level, or in a profile)",
-        f"[model_providers.{provider_id}]",
-        f"name = {toml_value(codex_provider_name(stack, client))}",
-        f"base_url = {toml_value(f'{stack.gateway_base}{OPENAI_PROXY_PATH}')}",
-        'wire_api = "responses"',
-        "",
-        f"[model_providers.{provider_id}.auth]",
-        f"command = {toml_value(command)}",
-        f"args = {toml_value(arguments)}",
-        f"refresh_interval_ms = {CODEX_TOKEN_REFRESH_MS}",
+        f"# Paste these tables into ~/.codex/config.toml, replacing any earlier [model_providers.{provider_id}].",
+        f"# Select the provider with a top-level  model_provider = \"{provider_id}\"  ABOVE the first",
+        "# [table] in the file (below a table it would belong to that table).",
+        "# Or let veritas do both: veritas codex --install-config",
+        codex_provider_tables(stack, client),
     ])
 
 
-@main.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+def codex_config_path():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+
+
+def _managed_markers(provider_id):
+    return (f"# >>> {provider_id}: managed by `veritas codex --install-config`; edits here are replaced >>>",
+            f"# <<< {provider_id} <<<")
+
+
+def install_codex_config(text, stack, client):
+    """config.toml text with this stack's veritas provider installed and selected, and the
+    model_provider it replaces (None if there was none). Re-running replaces the managed block,
+    so installing again (after a reinstall, or for another app on the stack) never duplicates it.
+    The result is parsed before it is returned; anything unexpected raises CodexConfigError and
+    the caller writes nothing."""
+    import tomllib
+    provider_id = codex_provider_id(stack)
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as problem:
+        raise CodexConfigError(f"it is not valid TOML ({problem}); fix it first")
+    start, end = _managed_markers(provider_id)
+    text = re.sub(rf"\n*^{re.escape(start)}\n.*?^{re.escape(end)}\n?", "\n", text,
+                  flags=re.DOTALL | re.MULTILINE)
+    if provider_id in tomllib.loads(text).get("model_providers", {}):
+        raise CodexConfigError(f"it already defines [model_providers.{provider_id}] outside the "
+                               f"block veritas manages (pasted from --print-config?): delete that "
+                               f"table, then run this again")
+    lines = text.splitlines(keepends=True)
+    first_table = next((index for index, line in enumerate(lines) if re.match(r"\s*\[", line)), len(lines))
+    selection = f"model_provider = {toml_value(provider_id)}\n"
+    previous = tomllib.loads(text).get("model_provider")
+    for index in range(first_table):
+        if re.match(r"\s*model_provider\s*=", lines[index]):
+            lines[index] = selection
+            break
+    else:
+        lines.insert(0, selection)
+    text = "".join(lines).rstrip("\n")
+    text = (text + "\n\n" if text else "") + "\n".join([start, codex_provider_tables(stack, client), end]) + "\n"
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as problem:
+        raise CodexConfigError(f"editing it would not leave valid TOML ({problem})")
+    installed = parsed.get("model_providers", {}).get(provider_id, {})
+    if parsed.get("model_provider") != provider_id or \
+            installed.get("auth", {}).get("args") != codex_token_command(stack, client)[1]:
+        raise CodexConfigError("its layout is unusual enough that the edit could not be verified")
+    return text, previous
+
+
+def write_codex_config(path, text):
+    """Replace config.toml atomically, keeping its mode and a copy of the previous version."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = path.with_name(path.name + ".bak-veritas")
+    mode = 0o600
+    if path.exists():
+        mode = path.stat().st_mode & 0o777
+        shutil.copy2(path, backup)
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        os.chmod(temporary_name, mode)
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+    return backup if backup.exists() else None
+
+
+def shell_only_overrides(stack):
+    """Veritas settings that live only in this shell's environment. Codex started by the IDE or
+    the desktop app won't have them, so its `veritas token` runs without them."""
+    scoped = stack.name.upper().replace("-", "_")
+    names = ["VERITAS_HOME", "VERITAS_TOKEN_STORE", f"VERITAS_{scoped}_AUTH_BASE",
+             f"VERITAS_{scoped}_GATEWAY_BASE"]
+    return [name for name in names if os.environ.get(name)]
+
+
+@main.command(context_settings=PASSTHROUGH_COMMAND)
 @with_stack
 @with_app
+@click.option("--install-config", is_flag=True,
+              help="Add the provider to ~/.codex/config.toml (or $CODEX_HOME) and select it, for "
+                   "plain `codex`, the IDE extension and the desktop app. Re-running replaces it.")
 @click.option("--print-config", is_flag=True,
-              help="Print the provider as a ~/.codex/config.toml block instead of running Codex, "
-                   "for the IDE extension or desktop app.")
+              help="Print the provider as config.toml tables to paste by hand, instead of running "
+                   "Codex.")
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
-def codex(stack, app, print_config, codex_args):
+def codex(stack, app, install_config, print_config, codex_args):
     """Run OpenAI Codex through the stack's OpenAI proxy as you, on your user token.
 
-    Every call is charged to your per-user AI Services limit inside the app's. Arguments after the
-    veritas options go to codex unchanged, e.g. `veritas codex -e dev exec "hello"` or
-    `veritas codex -e dev -m <model>`."""
+    Every call is charged to your per-user AI Services limit inside the app's. Put the veritas
+    options first: everything from codex's first argument on goes to codex unchanged, e.g.
+    `veritas codex -e dev exec "hello"` or `veritas codex -e dev -m <model>`."""
     store = core.token_store()
     client = resolve_client(store, stack, app)
-    record = fresh_record(store, stack, client)   # fail here, before launching, if not signed in
-    if record.get("grant") == "client_credentials":
-        fail(f"{client} holds an m2m token, which names no user: sign in with "
-             f"`veritas login -e {stack} --app <APP NAME>`")
-    if print_config:
-        click.echo(codex_config_block(stack, client))
-        return
-    codex_path = shutil.which("codex")
+    user_record(store, stack, client)
+    if install_config and print_config:
+        fail("use --install-config or --print-config, not both")
+    try:
+        if print_config:
+            click.echo(codex_config_block(stack, client))
+            return
+        if install_config:
+            path = codex_config_path()
+            current = path.read_text(encoding="utf-8") if path.exists() else ""
+            try:
+                text, previous = install_codex_config(current, stack, client)
+            except CodexConfigError as problem:
+                fail(f"left {path} unchanged: {problem}")
+            backup = write_codex_config(path, text)
+            provider_id = codex_provider_id(stack)
+            click.echo(f"Installed {provider_id} ({client}) in {path} and selected it: plain `codex`, "
+                       f"the IDE extension and the desktop app now run on your {stack} user token.")
+            if previous and previous != provider_id:
+                click.echo(f"It replaces model_provider = \"{previous}\"; set that back to switch.")
+            if backup:
+                click.echo(f"Previous version: {backup}")
+            overrides = shell_only_overrides(stack)
+            if overrides:
+                click.secho(f"Warning: {', '.join(overrides)} set in this shell won't reach Codex "
+                            f"started from the IDE or desktop app.", fg="yellow", err=True)
+            return
+        overrides = codex_overrides(stack, client)
+    except CodexConfigError as problem:
+        fail(str(problem))
+    codex_path = find_program("codex")
     if not codex_path:
         fail("codex (OpenAI Codex CLI) is not on PATH: install it first, or use "
-             f"`veritas codex -e {stack} --print-config` to configure the IDE extension")
-    launch([codex_path, *codex_overrides(stack, client), *codex_args], dict(os.environ))
+             f"`veritas codex -e {stack} --install-config` to configure the IDE extension")
+    launch([codex_path, *overrides, *codex_args], dict(os.environ))
 
 
 def run():

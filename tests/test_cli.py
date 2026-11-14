@@ -181,7 +181,7 @@ def test_claude_runs_claude_code_on_the_gateway_with_a_refreshing_token(monkeypa
     store.put("dev", "awa-cli", stored())
     store.set_active_client("dev", "awa-cli")
     launched = {}
-    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(cli, "find_program", lambda name: "/usr/local/bin/claude")
     monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.update(
         arguments=arguments, environment=environment))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "a-key-from-my-profile")
@@ -222,6 +222,11 @@ def test_claude_without_a_login_says_how_to_sign_in(monkeypatch):
     assert "veritas login" in result.output
 
 
+def toml_literal(value):
+    import tomllib
+    return tomllib.loads(f"probe = {value}")["probe"]
+
+
 def codex_flags(arguments):
     """{key: raw TOML value} from a list of `-c key=value` flags, and the arguments left over."""
     settings, rest, index = {}, [], 0
@@ -241,7 +246,7 @@ def test_codex_runs_codex_on_the_gateway_with_a_refreshing_token(monkeypatch, to
     store.put("dev", "awa-cli", stored())
     store.set_active_client("dev", "awa-cli")
     launched = {}
-    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/codex")
+    monkeypatch.setattr(cli, "find_program", lambda name: "/usr/local/bin/codex")
     monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.update(
         arguments=arguments, environment=environment))
 
@@ -253,12 +258,14 @@ def test_codex_runs_codex_on_the_gateway_with_a_refreshing_token(monkeypatch, to
     settings, passed_through = codex_flags(arguments)
     assert passed_through == ["exec", "hello", "-m", "m"]
     provider = "model_providers.veritas-dev"
-    assert json.loads(settings["model_provider"]) == "veritas-dev"
-    assert json.loads(settings[f"{provider}.base_url"]) == \
+    assert toml_literal(settings["model_provider"]) == "veritas-dev"
+    assert toml_literal(settings[f"{provider}.base_url"]) == \
         "https://dev.apis.huit.harvard.edu/ais-openai-direct/v2"
-    assert json.loads(settings[f"{provider}.auth.args"]) == \
+    assert toml_literal(settings[f"{provider}.auth.args"]) == \
         ["-P", "-m", "veritas.cli", "token", "-e", "dev", "--app", "awa-cli"]
-    assert int(settings[f"{provider}.auth.refresh_interval_ms"]) < 3600 * 1000
+    assert toml_literal(settings[f"{provider}.auth.refresh_interval_ms"]) < 3600 * 1000
+    # No double quotes on the command line: cmd.exe misreads them when codex is npm's codex.cmd.
+    assert not any('"' in argument for argument in arguments)
     # No model is chosen for the user, and no token or key is on the command line.
     assert not any(key == "model" for key in settings)
     assert "old-access" not in " ".join(launched["arguments"])
@@ -277,11 +284,24 @@ def test_codex_print_config_is_valid_toml_and_launches_nothing(monkeypatch, toke
     assert "old-access" not in result.output
 
 
-def test_codex_overrides_parse_as_toml_on_any_path():
-    tomllib = pytest.importorskip("tomllib")
-    settings, _ = codex_flags(cli.codex_overrides(resolve("dev"), 'awa-"odd" app'))
-    for key, value in settings.items():
-        tomllib.loads(f"probe = {value}")   # each value must be a TOML literal on its own
+@pytest.mark.parametrize("executable", ["/home/me/venv/bin/python",
+                                        "/home/m\u00e9/\U0001d11e venv/bin/python",
+                                        "C:\\Users\\me\\it's\\python.exe"])
+@pytest.mark.parametrize("client", ["awa-cli", 'awa-"odd" app', "awa-it's"])
+def test_codex_overrides_are_toml_that_round_trips(monkeypatch, executable, client):
+    monkeypatch.setattr(cli.sys, "executable", executable)
+    settings, _ = codex_flags(cli.codex_overrides(resolve("dev"), client))
+    provider = "model_providers.veritas-dev"
+    assert toml_literal(settings[f"{provider}.auth.command"]) == executable
+    assert toml_literal(settings[f"{provider}.auth.args"])[-1] == client
+    for value in settings.values():
+        toml_literal(value)   # each value is a TOML literal on its own
+
+
+def test_toml_value_handles_bools_and_refuses_undecodable_paths():
+    assert cli.toml_value(True) == "true" and cli.toml_value(False) == "false"
+    with pytest.raises(cli.CodexConfigError):
+        cli.toml_value("/home/\udcff/python")
 
 
 def test_codex_refuses_an_m2m_token(monkeypatch, token_endpoint):
@@ -296,10 +316,10 @@ def test_codex_refuses_an_m2m_token(monkeypatch, token_endpoint):
 def test_codex_not_installed_points_at_print_config(monkeypatch, token_endpoint):
     store = TokenStore()
     store.put("dev", "awa-cli", stored())
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli, "find_program", lambda name: None)
     result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--app", "awa-cli"])
     assert result.exit_code == 1
-    assert "--print-config" in result.output
+    assert "--install-config" in result.output
 
 
 @pytest.fixture
@@ -333,6 +353,151 @@ def test_claude_helper_ignores_a_veritas_package_in_the_project(project_shadowin
     result = run_from(project_shadowing_veritas, command)
     assert "SHADOWED" not in result.stdout
     assert result.returncode == 0 and "veritas, version" in result.stdout
+
+
+def signed_in(name="awa-cli"):
+    store = TokenStore()
+    store.put("dev", name, stored())
+    store.set_active_client("dev", name)
+
+
+@pytest.mark.parametrize("command", ["codex", "claude"])
+def test_tool_arguments_after_the_first_one_are_not_veritas_options(monkeypatch, token_endpoint, command):
+    signed_in()
+    launched = {}
+    monkeypatch.setattr(cli, "find_program", lambda name: f"/usr/local/bin/{name}")
+    monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.update(arguments=arguments))
+    passthrough = ["exec", "-e", "stage", "--app", "x", "--help", "--print-config", "--", "-m is a prompt"]
+    result = CliRunner().invoke(cli.main, [command, "-e", "dev", *passthrough])
+    assert result.exit_code == 0, result.output
+    assert launched["arguments"][-len(passthrough):] == passthrough
+    assert not any("stage" in argument for argument in launched["arguments"][:-len(passthrough)])
+
+
+def test_an_expired_m2m_client_is_refused_as_m2m_not_sent_to_renew_it(monkeypatch, token_endpoint):
+    store = TokenStore()
+    store.put("dev", "consumer-key", stored(grant="client_credentials", expires_in=-60, refresh_in=None))
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    for command in ("codex", "claude"):
+        result = CliRunner().invoke(cli.main, [command, "-e", "dev", "--app", "consumer-key"])
+        assert result.exit_code == 1
+        assert "names no user" in result.output and "veritas m2m" not in result.output
+
+
+def test_find_program_on_windows_skips_the_current_directory(tmp_path, monkeypatch):
+    project, tools = tmp_path / "project", tmp_path / "tools"
+    project.mkdir()
+    tools.mkdir()
+    (project / "codex.cmd").write_text("@echo planted")
+    (tools / "codex.cmd").write_text("@echo real")
+    monkeypatch.chdir(project)
+    environment = {"PATH": f".;{tools}", "PATHEXT": ".exe;.cmd"}
+    assert cli.find_program("codex", windows=True, environment=environment) == str(tools / "codex.cmd")
+    assert cli.find_program("codex", windows=True, environment={"PATH": ".", "PATHEXT": ".cmd"}) is None
+
+
+@pytest.mark.parametrize("argument", ['say "hi"', "50%", "a&b", "x|y", "a>b", "c^d"])
+def test_windows_launch_refuses_what_cmd_exe_would_misread(monkeypatch, argument):
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *arguments, **options: pytest.fail("must not run"))
+    with pytest.raises(SystemExit) as exited:
+        cli.launch([r"C:\npm\codex.cmd", "exec", argument], {}, windows=True)
+    assert exited.value.code == 1
+
+
+def test_windows_launch_of_an_exe_passes_any_argument(monkeypatch):
+    started = {}
+
+    class Finished:
+        def wait(self):
+            return 0
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda arguments, env: started.update(arguments=arguments) or Finished())
+    with pytest.raises(SystemExit):
+        cli.launch([r"C:\tools\codex.exe", "exec", 'say "hi" & 50%'], {}, windows=True)
+    assert started["arguments"][-1] == 'say "hi" & 50%'
+
+
+MARKS_CONFIG = """model = "gpt-5.5"
+model_provider = "apigee-prod"
+model_reasoning_effort = "low"
+
+[model_providers.apigee-prod]
+name = "Apigee Dev"
+base_url = "https://dev.apis.huit.harvard.edu/ais-openai-direct/v2"
+env_key = "CODEX_API_KEY_DEV"
+
+[projects."/Users/me/repo"]
+trust_level = "trusted"
+"""
+
+
+def test_install_config_selects_the_provider_at_top_level_and_keeps_everything_else():
+    import tomllib
+    text, previous = cli.install_codex_config(MARKS_CONFIG, resolve("dev"), "awa-cli")
+    parsed = tomllib.loads(text)
+    assert previous == "apigee-prod"
+    assert parsed["model_provider"] == "veritas-dev"
+    assert parsed["model_providers"]["veritas-dev"]["auth"]["args"][-2:] == ["--app", "awa-cli"]
+    assert parsed["model_providers"]["apigee-prod"]["env_key"] == "CODEX_API_KEY_DEV"
+    assert parsed["projects"]["/Users/me/repo"]["trust_level"] == "trusted"
+    assert parsed["model"] == "gpt-5.5"
+
+
+def test_install_config_again_replaces_its_block_instead_of_duplicating_it():
+    import tomllib
+    once, _ = cli.install_codex_config(MARKS_CONFIG, resolve("dev"), "awa-one")
+    twice, previous = cli.install_codex_config(once, resolve("dev"), "awa-two")
+    assert previous == "veritas-dev"
+    assert twice.count("[model_providers.veritas-dev]") == 1
+    assert tomllib.loads(twice)["model_providers"]["veritas-dev"]["auth"]["args"][-1] == "awa-two"
+    assert cli.install_codex_config(twice, resolve("dev"), "awa-two")[0] == twice   # stable
+
+
+def test_install_config_into_an_empty_or_missing_file():
+    import tomllib
+    text, previous = cli.install_codex_config("", resolve("dev"), "awa-cli")
+    assert previous is None and tomllib.loads(text)["model_provider"] == "veritas-dev"
+
+
+@pytest.mark.parametrize("config, message", [
+    ("model = [\n", "not valid TOML"),
+    ("[model_providers.veritas-dev]\nname = 'pasted by hand'\n", "outside the block"),
+])
+def test_install_config_refuses_and_changes_nothing(config, message):
+    with pytest.raises(cli.CodexConfigError, match=message):
+        cli.install_codex_config(config, resolve("dev"), "awa-cli")
+
+
+def test_install_config_command_writes_codex_home_and_keeps_a_backup(monkeypatch, token_endpoint, tmp_path):
+    import tomllib
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(MARKS_CONFIG)
+    monkeypatch.setattr(cli, "launch", lambda *arguments: pytest.fail("must not launch"))
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 0, result.output
+    assert "apigee-prod" in result.output
+    assert tomllib.loads((tmp_path / "config.toml").read_text())["model_provider"] == "veritas-dev"
+    assert (tmp_path / "config.toml.bak-veritas").read_text() == MARKS_CONFIG
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_install_config_leaves_a_broken_file_alone(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text("model = [\n")
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 1 and "unchanged" in result.output
+    assert (tmp_path / "config.toml").read_text() == "model = [\n"
+    assert not (tmp_path / "config.toml.bak-veritas").exists()
+
+
+def test_install_config_warns_about_settings_only_this_shell_has(monkeypatch, token_endpoint, tmp_path):
+    signed_in()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("VERITAS_DEV_AUTH_BASE", "https://go.example.edu/oauth2/v1")
+    result = CliRunner().invoke(cli.main, ["codex", "-e", "dev", "--install-config"])
+    assert result.exit_code == 0, result.output
+    assert "VERITAS_DEV_AUTH_BASE" in result.output
 
 
 def test_helper_command_on_windows_reads_the_same_in_cmd_and_git_bash(monkeypatch):
