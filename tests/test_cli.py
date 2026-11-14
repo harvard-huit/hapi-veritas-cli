@@ -725,6 +725,7 @@ def test_claude_on_windows_refuses_app_names_its_helper_shell_would_expand(monke
 @pytest.mark.parametrize("app", ["_tool", "team%x", " spaced", "awa-$(id)"])
 def test_app_names_apigee_allows_work_where_no_shell_sees_them(monkeypatch, token_endpoint, app):
     signed_in(app)
+    monkeypatch.setattr(cli, "WINDOWS", False)   # on Windows, veritas claude refuses some (test above)
     launched = []
     monkeypatch.setattr(cli, "find_program", lambda name: f"/usr/local/bin/{name}")
     monkeypatch.setattr(cli, "launch", lambda arguments, environment: launched.append(arguments))
