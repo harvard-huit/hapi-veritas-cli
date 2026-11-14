@@ -28,7 +28,7 @@ python3 -m venv .venv
 ```
 
 Add `@<branch-or-tag>` to the end of the URL to pin a version, e.g.
-`...hapi-veritas-cli.git@stage`. Without it you get the default branch, `development`.
+`...hapi-veritas-cli.git@stage`. Without it you get the default branch, `main` (what is released).
 
 **To work on the CLI itself:**
 
