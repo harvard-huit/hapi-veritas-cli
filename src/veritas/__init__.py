@@ -7,7 +7,7 @@
 See veritas.api for the whole API.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .api import Auth, VeritasError, authorization, gateway, headers, login, token  # noqa: E402
 

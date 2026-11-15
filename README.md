@@ -28,7 +28,7 @@ python3 -m venv .venv
 ```
 
 Add `@<branch-or-tag>` to the end of the URL to pin a version, e.g.
-`...hapi-veritas-cli.git@stage`. Without it you get the default branch, `development`.
+`...hapi-veritas-cli.git@stage`. Without it you get the default branch, `main` (what is released).
 
 **To work on the CLI itself:**
 
@@ -110,7 +110,7 @@ veritas.login(app="awa-workshop_x")              # the browser sign-in, from Pyt
 ```bash
 veritas login -e dev --app awa-veritas_cli     # once; the app needs Bedrock granted in AI access
 veritas claude -e dev                          # interactive Claude Code
-veritas claude -e dev -p "explain this repo"   # anything after the veritas options goes to claude
+veritas claude -e dev -p "explain this repo"   # veritas options first; the rest goes to claude
 veritas claude -e dev --model us.anthropic.claude-sonnet-5-5
 ```
 
@@ -131,6 +131,78 @@ Every request is charged to your **per-user** Bedrock limit, inside the app's. C
 lot of context with each request: a one-line Haiku prompt cost about $0.05. A per-user limit sized
 for curl tests (cents per hour) will stop a session on its first request with a 429. Set
 `CLAUDE_CODE_MAX_RETRIES=1` to make that fail fast instead of retrying.
+
+### Codex as you
+
+```bash
+veritas login -e dev --app awa-veritas_cli     # once; the app needs OpenAI granted in AI access
+veritas codex -e dev                           # interactive Codex
+veritas codex -e dev exec "explain this repo"  # veritas options first; the rest goes to codex
+veritas codex -e dev -m <model>
+```
+
+`veritas codex` runs the Codex CLI against `<gateway>/ais-openai-direct/v2` with a provider named
+`veritas-<stack>`, passed as `-c` overrides for that one run. Your `~/.codex/config.toml` is not
+changed. The provider has no key. Its `auth.command` is `veritas token`, so Codex gets your user
+token from the veritas store. Codex re-runs the command every 5 minutes and after any 401, so a
+session outlasts the one-hour token. That command takes priority over an `OPENAI_API_KEY` or
+`CODEX_API_KEY` in your environment. The command runs Python with `-P`, so a `veritas/` or
+`click.py` in the project you have open can't run in place of veritas.
+
+**Put the veritas options (`-e`, `--app`) first, before any codex option.** veritas reads its
+own options up to the first word that isn't an option (`exec`, a prompt) and passes everything
+from there on to codex unchanged, its own `-e`, `--help` and `--` included:
+`veritas codex -e dev exec --help` is codex's help. A codex flag placed before that word doesn't
+stop veritas reading either, which is why the order matters: in `veritas codex -m gpt-5 -e dev`,
+`gpt-5` ends the veritas options, so `-e dev` goes to codex (which rejects it) and veritas looks
+for a token on your default stack. Write `veritas codex -e dev -m gpt-5`. `veritas claude` works
+the same way.
+
+Codex shows one startup warning: `Running without the shared background server: command-line
+configuration overrides ... requires embedded mode.` It is harmless. Codex runs its own server for
+the session instead of the shared one. The session is still saved, so `codex resume` and
+`codex fork` work. What you lose is reaching the session *while it runs* from somewhere else:
+`codex agents`, `codex queue`, remote control, or the desktop app. Every way of setting config
+on the command line causes the warning, `--profile` included. To use the shared server, install
+the provider in `~/.codex/config.toml` (below) and start plain `codex`.
+
+**The IDE extension and the desktop app** start Codex themselves, so veritas can't pass it flags.
+Install the provider in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) instead:
+
+```bash
+veritas codex -e dev --app awa-veritas_cli --install-config
+```
+
+This adds the `[model_providers.veritas-dev]` and `[model_providers.veritas-dev.auth]` tables
+and sets the top-level `model_provider = 'veritas-dev'`, so plain `codex`, the IDE extension and
+the desktop app all use it. It says which provider it replaced (or that Codex was on its default),
+so you can switch back, and keeps the previous file as `config.toml.bak-veritas-<timestamp>`: one
+per run that changes something, so the file from before your first install is never overwritten.
+They are full copies of your config, including anything else you keep in it (MCP server tokens,
+say); delete the ones you no longer need. Running it when nothing would change writes nothing. Running it again (after
+reinstalling veritas, or for another app on the same stack) replaces those two tables and nothing
+else; MCP servers, trusted projects and anything else Codex has added stay. veritas checks the
+result by meaning, not just syntax: apart from `model_provider` and its own tables, the new file
+must parse to exactly what the old one held, or nothing is written. A symlinked `config.toml`
+(dotfiles) is written through to its target. The tables hold the path of the Python veritas runs
+from, and no token or secret.
+
+A trusted project's own `.codex/config.toml` can still pick another provider for that project.
+If your `config.toml` uses TOML 1.1 syntax that Python's parser can't read (a multi-line inline
+table, say), veritas refuses to edit it; paste the `--print-config` tables in by hand.
+
+`VERITAS_HOME`, `VERITAS_TOKEN_STORE` and `VERITAS_<STACK>_AUTH_BASE` set in your shell don't reach
+a Codex started from the IDE or the Dock, and neither does `CODEX_HOME`. A
+`VERITAS_<STACK>_GATEWAY_BASE` override, on the other hand, is written into the config and stays.
+`--install-config` warns about each of these. To paste the
+block yourself instead, `--print-config` prints it with instructions.
+
+veritas sets no model here either. Codex uses the `model` from your config or `-m`, and the proxy
+has to allow it. A config that `--install-config` creates from scratch has no `model` line, so
+Codex picks its own default, which changes between Codex releases and decides what each request
+costs. Set `model = "..."` in `config.toml` or pass `-m` to choose. Every request is charged to your **per-user** OpenAI limit, inside the app's.
+Codex retries a failed request up to 5 times by default, so a per-user limit sized for curl tests
+will be hit fast.
 
 ## Windows
 
@@ -155,7 +227,23 @@ veritas claude --model us.anthropic.claude-haiku-4-5-20251001-v1:0
 - **`veritas claude` runs Claude Code as a child process** on Windows, because Windows has no
   `exec`, and exits with its exit code. Ctrl+C goes to Claude Code. Its settings are written to
   `%USERPROFILE%\.config\veritas\claude\<stack>-<app>.json`, and the token helper's command is
-  quoted to read the same in cmd.exe and Git Bash.
+  quoted to read the same in cmd.exe and Git Bash. `veritas codex` does the same.
+- **`claude` and `codex` are looked up on PATH only**, not in the current directory first (which
+  Windows otherwise does), so a `codex.cmd` committed to a repo can't stand in for the real one.
+- **npm installs them as `.cmd` scripts, which cmd.exe re-reads.** veritas refuses to pass an
+  argument containing `"`, `%`, `^`, `&`, `|`, `<` or `>` to one, because cmd.exe would misread
+  it. If cmd.exe's delayed expansion is turned on (`DelayedExpansion=1` under
+  `HKCU` or `HKLM\Software\Microsoft\Command Processor`), `!` is refused too: cmd.exe would
+  replace `!NAME!` with that environment variable's value and drop a lone `!`. It is off by
+  default, so "Fix this!" works on most machines. Keep those characters out of prompts given on the command line (point the tool at a file
+  instead), or use `veritas codex --install-config` and run `codex` directly. If the character is
+  in veritas's own settings (`AT&T` in the path of your Python, say), it says so and points you
+  to `--install-config` (or, for `veritas claude`, to `VERITAS_HOME`). PATH entries that aren't
+  absolute (`bin`, `C:bin`, `\bin`) are skipped as well. `veritas claude` refuses an app name
+  holding `"`, `%`, `$`, `` ` ``, `!`, `^`, `&`, `|`, `<`, `>` or `\` on Windows, because Claude Code
+  may run its token helper through cmd.exe or Git Bash, which would expand them; `veritas codex`
+  doesn't have that limit. Untested on real Windows so far; the tests run the Windows code paths
+  on every OS.
 - **The tests run on Windows, macOS and Linux in GitHub Actions** (`veritas-cli tests`).
 
 ## Stacks

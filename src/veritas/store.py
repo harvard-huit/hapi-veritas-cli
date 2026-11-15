@@ -14,6 +14,7 @@ The config file (``config.json``, no secrets) remembers the active client per st
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 KEYRING_SERVICE = "veritas"
@@ -35,11 +36,17 @@ def write_private_json(path, content):
     """Write JSON readable only by this user (0600 in a 0700 directory). Windows ignores the modes;
     the file lives under the user's profile, which only that user can read by default."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        json.dump(content, handle, indent=2, sort_keys=True)
-    os.replace(temporary_path, path)
+    # A temporary name of its own (mkstemp creates it 0600): two writers at once, e.g. Codex and
+    # Claude Code refreshing together, would otherwise share one .tmp and one os.replace would fail.
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".",
+                                                  suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(content, handle, indent=2, sort_keys=True)
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
 
 
 def _read_json(path):
